@@ -1,0 +1,1617 @@
+---
+title: "Expal6 analysis: PSM aggregation and mapping"
+author: "Ben Jenkins"
+date: '2025-07-10'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(conflicted)
+library(tidyverse)
+library(cowplot)
+library(plyr)
+
+library(MSnbase)
+library(QFeatures)
+library(Rtsne)
+library(umap)
+library(FactoMineR)
+library(factoextra)
+
+conflicts_prefer(QFeatures::longFormat)
+conflicts_prefer(dplyr::mutate)
+conflicts_prefer(dplyr::arrange)
+conflicts_prefer(dplyr::summarise)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(magrittr::set_names)
+```
+
+```{r loading PSM data and defining TMT order}
+#reading QFeatures object containing complete PSM data
+ls_QFeat <- readRDS(file = "files/Expal_ls_QFeat_filt_norm_imp.RDS")
+
+#names of final base datasets
+nm_iter <- c("Expal4", "Expal5")
+
+#TMT order for viewing distribution profiles
+TMT_order <- c("126", "127N", "127C", "128N",
+               "128C", "129N", "129C", "130N",
+               "130C", "131N", "131C", "132N",
+               "132C", "133N", "133C", "134N")
+```
+
+
+```{r aggregation from psm to protein level and row sum normalisation}
+#Step-wise aggregation from psm to peptide to protein level - rescaling of pep/prot data
+ls_QFeat <-  
+  lapply(X = names(ls_QFeat),
+         FUN = function(i) {
+           
+           #get obj
+           obj <- ls_QFeat[[i]]
+
+           ##aggregation psm to peptide using mean values (profiles are on percent scale)
+           obj <- aggregateFeatures(object = obj,
+                                    i = "psms_norm",
+                                    fcol = "Sequence",
+                                    name = "pep",  
+                                    fun = colMeans)
+           
+           #rescale (sum-normalise) pep to a row-sum of 100%
+           obj <- normalize(object = obj,
+                            method = "sum",
+                            i = "pep",
+                            name = "pep_norm")
+           
+           ##aggregation psm to peptide using mean values (profiles are on percent scale)
+           obj <- aggregateFeatures(object = obj,
+                                    i = "pep_norm",
+                                    fcol = "Master.Protein.Accessions",
+                                    name = "prot",
+                                    fun = colMeans)
+           
+           #rescale (sum-normalise) prot to a row-sum of 100%
+           obj <- normalize(object = obj,
+                            method = "sum",
+                            i = "prot",
+                            name = "prot_norm")
+           
+           return(obj)
+         }) %>% 
+  set_names(nm_iter)
+
+#row sums of aggregated protein profiles within each experiment are 1
+lapply(seq_along(names(ls_QFeat)),
+       FUN = function(i) {
+         ls_QFeat[[i]][["prot_norm"]] %>% 
+           assay() %>% 
+           rowSums() %>%
+           summary()
+       })
+
+
+#Violin and box plots of TMT abundances across channels in ls_QFeat layers
+pdf(file = "graphs/Boxplot_normalisations_QFeat.pdf", width = 18)
+lapply(X = names(ls_QFeat),
+       FUN = function(i)  {
+         
+         #get obj
+         obj <- ls_QFeat[[i]]
+         
+         A <- 
+           longFormat(obj[["psms_norm"]]) %>%
+           ggplot(aes(x = factor(colname, levels = TMT_order),
+                      y = value)) +
+           geom_violin(trim = FALSE) +
+           geom_boxplot(width = 0.1) +
+           theme_bw() +
+           ggtitle(paste0(i,
+                          ":",
+                          " psms_norm")) +
+           ylab("relative intensity") +
+           xlab("TMT channel") +   
+           ylim(0, 0.7)
+         
+         
+         B <- 
+           longFormat(obj[["pep_norm"]]) %>% 
+           ggplot(aes(x = factor(colname, levels = TMT_order),
+                      y = value)) +
+           geom_violin(trim = FALSE) +
+           geom_boxplot(width = 0.1) +
+           theme_bw() +
+           ggtitle(label = "pep_norm") +
+           ylab("relative intensity") +
+           xlab("TMT channel") +
+           ylim(0, 0.7)
+         
+         
+         C <- 
+           longFormat(obj[["prot_norm"]]) %>% 
+           ggplot(aes(x = factor(colname, levels = TMT_order),
+                      y = value)) +
+           geom_violin(trim = FALSE) +
+           geom_boxplot(width = 0.1) +
+           theme_bw() +
+           ggtitle(label = "prot_norm") +
+           ylab("relative intensity") +
+           xlab("TMT channel") +
+           ylim(0, 0.7)
+         
+         plot <- plot_grid(A, B, C,
+                           nrow = 1,
+                           ncol = 3,
+                           labels = "AUTO")
+         return(plot)
+       })
+dev.off()
+
+#save the final aggregated ls_QFeat file
+saveRDS(ls_QFeat, file = "files/Expal_QFeat_aggregated.RDS")
+```
+
+
+```{r MSnSet for aggvar - data}
+#dataset to use:
+ls_QFeat <- readRDS(file = "files/Expal_QFeat_aggregated.RDS")
+
+#create MSnSet object using psms_ and pep_norm data; necessary for aggvar(MSnbase) function
+ls_Expal_MSnSet <- 
+  lapply(X = names(ls_QFeat),
+         FUN = function(i) {
+           
+           #get object
+           obj <- ls_QFeat[[i]]
+           
+           #coerce into MSnSet
+           MSn_psm <- MSnSet(exprs = obj[["psms_norm"]] %>% assay(),
+                             fData = obj[["psms_norm"]] %>% rowData() %>% as.data.frame())
+           
+           MSn_pep <- MSnSet(exprs = obj[["pep_norm"]] %>% assay(),
+                             fData = obj[["pep_norm"]] %>% rowData() %>% as.data.frame())
+           
+           list <- list(psm = MSn_psm,
+                        pep = MSn_pep)
+           
+           return(list)
+         }) %>%
+  set_names(nm_iter)
+
+
+#List of aggvar objects used to identify protein groups with incoherent expression patterns
+ls_aggvar_objects <- 
+  lapply(X = names(ls_Expal_MSnSet),
+         FUN = function(i) {
+           #get obj
+           obj <- ls_Expal_MSnSet[[i]]
+           
+#Protein level aggvar           
+           #aggvar_mean per protein based on peptides
+           aggvar_protein_mean <-
+             aggvar(obj[["pep"]],
+                    groupBy = "Master.Protein.Accessions",
+                    fun = "mean") %>%
+             as.data.frame() %>%
+             rownames_to_column(var = "Master.Protein.Accessions") %>%
+             select(-nb_feats) %>% 
+             setNames(c("Master.Protein.Accessions", "prot.aggv.dist.mean"))
+           
+           #aggvar_max per protein based on peptides
+           aggvar_protein_max <-
+             aggvar(obj[["pep"]],
+                    groupBy = "Master.Protein.Accessions",
+                    fun = "max") %>%
+             as.data.frame() %>%
+             rownames_to_column(var = "Master.Protein.Accessions") %>% 
+             setNames(c("Master.Protein.Accessions", "prot.aggv.dist.max", "prot.nb.feats"))
+           
+           #SPS Mass Match mean at protein level
+           SPS_match_mean_protein <-
+             fData(obj[["psm"]]) %>%
+             group_by(Master.Protein.Accessions) %>%
+             summarise_at(vars(SPS.Mass.Matches.in.Percent),
+                          list(~ mean(., na.rm = FALSE))) %>% 
+             as.data.frame() %>%
+             setNames(c("Master.Protein.Accessions", "prot.mean.SPS.MM"))
+           
+           #joined aggvar dataframe for protein level 
+           aggvar_protein <- 
+             join_all(dfs = list(aggvar_protein_mean,
+                                 aggvar_protein_max,
+                                 SPS_match_mean_protein),
+                      by = "Master.Protein.Accessions",
+                      type = "left") %>%
+             mutate(Sequence = "N/A") %>%
+             relocate("Sequence", .before = "prot.aggv.dist.mean")
+
+           
+#Peptide level aggvar           
+           #aggvar_mean peptide level based on PSMs
+           aggvar_peptide_mean <-
+             aggvar(obj[["psm"]],
+                    groupBy = "Sequence",
+                    fun = "mean") %>%
+             as.data.frame() %>%
+             rownames_to_column(var = "Sequence") %>%
+             select(-nb_feats) %>% 
+             setNames(c("Sequence", "pep.aggv.dist.mean"))
+           
+           #aggvar_max peptide level based on PSMs
+           aggvar_peptide_max <-
+             aggvar(obj[["psm"]],
+                    groupBy = "Sequence",
+                    fun = "max") %>%
+             as.data.frame() %>%
+             rownames_to_column(var = "Sequence") %>% 
+             setNames(c("Sequence", "pep.aggv.dist.max", "pep.nb.feats"))
+           
+           #SPS Mass Match mean at peptide level
+           SPS_match_mean_peptide <-
+             fData(obj[["psm"]]) %>%
+             group_by(Sequence) %>%
+             summarise_at(vars(SPS.Mass.Matches.in.Percent),
+                          list(~ mean(., na.rm = FALSE))) %>% 
+             as.data.frame() %>%
+             setNames(c("Sequence", "pep.mean.SPS.MM"))
+           
+           #joined aggvar dataframe for peptide level 
+           aggvar_peptide <- 
+             join_all(dfs = list(aggvar_peptide_mean,
+                                 aggvar_peptide_max,
+                                 SPS_match_mean_peptide),
+                      by = "Sequence",
+                      type = "left")
+           
+           ##reference for master accession of each peptide sequence
+           Master_ref <- 
+             fData(obj[["psm"]]) %>%
+             select(Master.Protein.Accessions, Sequence) %>% 
+             distinct()
+           
+           aggvar_peptide <- 
+             right_join(Master_ref,
+                        aggvar_peptide,
+                        by = "Sequence") %>%
+             relocate(Sequence, .before = "pep.aggv.dist.mean")
+           
+           
+#aggvar_objects for protein and peptide
+           aggvar_object <-
+             list(aggvar_protein,
+                  aggvar_peptide) %>%
+             set_names(c("prot", "pep"))
+           
+           return(aggvar_object)
+           
+         }) %>%
+  set_names(nm_iter)
+
+#save aggvar file
+saveRDS(ls_aggvar_objects, file = "files/aggvar_objects.RDS")
+
+rm(ls_Expal_MSnSet)
+```
+
+
+```{r MSnSet for aggvar - graphs}
+ls_aggvar_objects <- readRDS(file = "files/aggvar_objects.RDS")
+
+#Corresponding aggvar graphs
+graphs_aggvar_objects <- 
+  lapply(X = names(ls_aggvar_objects),
+         function(i)  {
+           
+           #get obj
+           obj <- ls_aggvar_objects[[i]]
+           
+#aggvar protein level           
+           A <- 
+             obj[["prot"]] %>% 
+             arrange(desc(prot.mean.SPS.MM)) %>%
+             ggplot(aes(x = prot.nb.feats,
+                        y = prot.aggv.dist.mean,
+                        colour = prot.mean.SPS.MM)) +
+             geom_point(position = position_jitter(width = 0.03,
+                                                   height = 0)) +
+             scale_x_continuous(trans = "log10") +
+             annotation_logticks(sides = "b") +
+             ggtitle(label = "protein; aggvar_mean", i) +
+             xlab("number of peptides") +
+             theme_bw() +
+             scale_color_gradientn(colours = rainbow(5)) +
+             theme(legend.position = "none") +
+             guides(color = guide_legend("mean SPS Mass Match %", nrow = 1))
+
+           
+           B <- 
+             obj[["prot"]] %>% 
+             arrange(desc(prot.mean.SPS.MM)) %>%
+             ggplot(aes(x = prot.nb.feats,
+                        y = prot.aggv.dist.max,
+                        colour = prot.mean.SPS.MM)) +
+             geom_point(position = position_jitter(width = 0.03,
+                                                   height = 0)) +
+             scale_x_continuous(trans = "log10") +
+             annotation_logticks(sides = "b") +
+             ggtitle(label = "protein; aggvar_max", i) +
+             xlab("number of peptides") +
+             theme_bw() +
+             scale_color_gradientn(colours = rainbow(5)) +
+             theme(legend.position = "none") +
+             guides(color = guide_legend("mean SPS Mass Match %"))
+
+           C <- 
+             obj[["prot"]] %>% 
+             arrange(desc(prot.mean.SPS.MM)) %>%
+             ggplot(aes(x = prot.aggv.dist.mean,
+                        y = prot.aggv.dist.max,
+                        colour = prot.mean.SPS.MM)) +
+             geom_point() +
+             ggtitle(label = "protein; max vs mean", i) +
+             theme_bw() +
+             scale_color_gradientn(colours = rainbow(5)) +
+             theme(legend.position = "none") +
+             guides(color = guide_legend("mean SPS Mass Match %"))
+
+           D <- plot_grid(A, B, C, nrow = 1, ncol = 3,
+                          labels = "AUTO",
+                          rel_widths = c(1, 1, 1))
+           
+           legend_A <- ggpubr::get_legend(A + theme(legend.position = "bottom"))
+           
+           E <- plot_grid(D, legend_A, ncol = 1, rel_heights = c(1, 0.05))
+
+##aggvar peptide level           
+           F1 <-
+             obj[["pep"]] %>% 
+             arrange(desc(pep.mean.SPS.MM)) %>%
+             ggplot(aes(x = pep.nb.feats,
+                        y = pep.aggv.dist.mean,
+                        colour = pep.mean.SPS.MM)) +
+             geom_point(position = position_jitter(width = 0.03,
+                                                   height = 0)) +
+             scale_x_continuous(trans = "log10") +
+             annotation_logticks(sides = "b") +
+             ggtitle(label = "peptide; aggvar_mean", i) +
+             xlab("number of PSMs") +
+             theme_bw() +
+             scale_color_gradientn(colours = rainbow(5)) +
+             theme(legend.position = "none") +
+             guides(color=guide_legend("mean SPS Mass Match %", nrow = 1))
+
+           
+           G <- 
+             obj[["pep"]] %>% 
+             arrange(desc(pep.mean.SPS.MM)) %>%
+             ggplot(aes(x = pep.nb.feats,
+                        y = pep.aggv.dist.max,
+                        colour = pep.mean.SPS.MM)) +
+             geom_point(position = position_jitter(width = 0.03,
+                                                   height = 0)) +
+             scale_x_continuous(trans = "log10") +
+             annotation_logticks(sides = "b") +
+             ggtitle(label = "peptide; aggvar_max", i) +
+             xlab("number of PSMs") +
+             theme_bw() +
+             scale_color_gradientn(colours = rainbow(5)) +
+             theme(legend.position = "none") +
+             guides(color=guide_legend("mean SPS Mass Match %"))
+
+           H <- 
+             obj[["pep"]] %>% 
+             arrange(desc(pep.mean.SPS.MM)) %>%
+             ggplot(aes(x = pep.aggv.dist.mean,
+                        y = pep.aggv.dist.max,
+                        colour = pep.mean.SPS.MM)) +
+             geom_point() +
+             guides(color=guide_legend("mean SPS Mass Match %")) +
+             ggtitle(label = "peptide; max vs mean", i) +
+             theme_bw() +
+             scale_color_gradientn(colours = rainbow(5)) +
+             theme(legend.position = "none") +
+             guides(color = guide_legend("mean SPS Mass Match %"))
+
+           H <- plot_grid(F1, G, H, nrow = 1, ncol = 3,
+                          labels = "AUTO",
+                          rel_widths = c(1, 1, 1))
+           
+           legend_F1 <- ggpubr::get_legend(F1 + theme(legend.position = "bottom"))
+           
+           I <- plot_grid(H, legend_F1, ncol = 1, rel_heights = c(1, 0.05))
+           
+           X <- list(E, I) %>% set_names(c("plot.aggvar.prot", "plot.aggvar.pep"))
+           
+           return(X)
+         }) %>% 
+  set_names(nm_iter)
+
+warnings()
+
+#save aggvar plots
+pdf(file = "graphs/aggvar_protein_features.pdf", width = 11, height = 8)
+for (i in seq(1, length(graphs_aggvar_objects)))  {
+  graphs_aggvar_objects[[i]][["plot.aggvar.prot"]] %>% print()
+  
+  graphs_aggvar_objects[[i]][["plot.aggvar.pep"]] %>% print()
+}
+dev.off()
+rm(i)
+
+rm(graphs_aggvar_objects)
+```
+
+
+```{r adding aggvar mean+max and stdev to ls_QFeat objects}
+#ls_QFeat <- readRDS(file = "files/Expal_QFeat_aggregated.RDS")
+#ls_aggvar_objects <- readRDS(file = "files/aggvar_objects.RDS")
+
+#Adding aggvar data and profile stdev to the ls_QFeat list object
+ls_QFeat <- 
+  lapply(X = names(ls_aggvar_objects),
+         FUN = function(i){
+                      
+           #define ls_QFeat set to use for addition
+           QFeat_set <- ls_QFeat[[i]]
+
+#Profile range from assay data
+           psm_range <- 
+             ls_QFeat[[i]][["psms_norm"]] %>% assay() %>% as.data.frame() %>%
+             mutate(psm.profile.stdev = matrixStats::rowSds(as.matrix(.))) %>% 
+             select(psm.profile.stdev)
+           
+           peptide_range <- 
+             ls_QFeat[[i]][["pep_norm"]] %>% assay() %>% as.data.frame() %>%
+             mutate(pep.profile.stdev = matrixStats::rowSds(as.matrix(.))) %>% 
+             select(pep.profile.stdev) %>% rownames_to_column(var = "Sequence")
+           
+           protein_range <- 
+             ls_QFeat[[i]][["prot_norm"]] %>% assay() %>% as.data.frame() %>%
+             mutate(prot.profile.stdev = matrixStats::rowSds(as.matrix(.))) %>% 
+             select(prot.profile.stdev) %>% rownames_to_column(var = "Master.Protein.Accessions")
+           
+#joined profile and aggvar data (x determines row order, which has to be the same as in ls_QFeat object)
+           peptide_level_data <-
+             left_join(x = peptide_range,
+                       y = ls_aggvar_objects[[i]][["pep"]],
+                       by = "Sequence") %>% 
+             select(-Sequence, -Master.Protein.Accessions)
+           
+           protein_level_data <- 
+             left_join(x = protein_range,
+                       y = ls_aggvar_objects[[i]][["prot"]],
+                       by = "Master.Protein.Accessions") %>% 
+             select(-Sequence, -Master.Protein.Accessions)
+           
+           #add DataFrames as new columns in rowData
+           rowData(QFeat_set) <- List(psms_norm = DataFrame(psm_range))
+           rowData(QFeat_set) <- List(pep_norm = DataFrame(peptide_level_data))
+           rowData(QFeat_set) <- List(prot_norm = DataFrame(protein_level_data))
+
+           return(QFeat_set)
+           
+         }) %>% 
+  set_names(nm_iter)
+
+#save the final aggregated ls_QFeat file
+saveRDS(ls_QFeat, file = "files/Expal_QFeat_aggreg_aggvar.RDS")
+```
+
+
+```{r Protein peptide support}
+#Protein PSM support pattern of 0.25 datasets
+pdf(file = "graphs/Peptide_support_per_protein.pdf", width = 11, height = 5)
+lapply(X = names(ls_QFeat),
+       FUN = function(i) {
+         
+         #get object  
+         obj <- ls_QFeat[[i]][["prot_norm"]]
+         
+        #Peptide count table - Peptides per accession
+         Z <-
+           rowData(obj)$prot.nb.feats %>%
+           table() %>%
+           as.data.frame.table() %>% 
+           set_names((c("Pep.per.Accession", "Freq")))
+         
+         #adding grouping for +6 peptides per protein and summarising counts
+         Y <- 
+           Z %>% 
+           mutate(Pep.per.Accession = ifelse(test = as.integer(Pep.per.Accession) <= 5,
+                                  yes = Pep.per.Accession,
+                                  no = "6+")) %>%
+           group_by(Pep.per.Accession) %>% 
+           summarise(N = sum(Freq)) %>% 
+           mutate(percent = round(N/sum(N) *100, digits = 1))
+         
+         #plot PSM support per protein
+         W <- 
+           Y %>% 
+           ggplot(aes(x = Pep.per.Accession,
+                      y = N,
+                      fill = Pep.per.Accession)) +
+           geom_col() +
+           scale_fill_brewer(palette = "RdBu",
+                             direction = 1) +
+           geom_text(aes(label = N),
+                     vjust = -0.5) +
+           theme_bw() +
+           theme(legend.position = "none") +
+           ggtitle(paste("Protein peptide support:",
+                         i,
+                         "N =",
+                         rowData(obj)$Master.Protein.Accessions %>% unique() %>% length(),
+                         sep = " ")) +
+           xlab("number of peptides per protein") +
+           ylab("N")
+         
+         #plot relative proportion of PSM support categories
+         U <- 
+           Y %>% 
+           ggplot(aes(x = "",
+                      y = percent,
+                      fill = Pep.per.Accession)) +
+           geom_col() +
+           scale_fill_brewer(palette = "RdBu",
+                             direction = 1) +
+           guides(fill = guide_legend(title = "#peptides per protein")) +
+           theme_void() +
+           geom_text(aes(label = paste0(percent, "%")),
+                     position = position_stack((vjust = 0.5))) +
+           coord_polar(theta = "y",
+                       start = 0,
+                       direction = -1)
+         
+         S <- plot_grid(W, U,
+                        nrow = 1,
+                        ncol = 2,
+                        labels = "AUTO")
+         return(S)
+       })
+dev.off()
+
+```
+
+
+```{r create t-SNE coordinates for psm level data}
+#ls_QFeat <- readRDS(file = "files/Expal_QFeat_aggreg_aggvar.RDS")
+
+
+#read RDS file containing the psm tSNE objects
+#Expal_psms_norm_tSNE_objects <- readRDS(file = "files/Expal_psms_norm_tSNE_theta01.RDS")
+
+#create tSNE maps for psm level across individual datasets
+Expal_psms_norm_tSNE_objects <- 
+  lapply(X = names(ls_QFeat),
+         FUN = function(i){
+           
+           #get object
+           obj <- ls_QFeat[[i]][["psms_norm"]]
+           
+           #note that there are expected duplicates in the psm quantitation data and we keep them, but will set check_duplicates = FALSE in the rtsne run
+           TMT_assay <- obj %>% assay()
+           
+           #seed for reproducibility
+           set.seed(117)
+           
+           #generate tSNE object
+           tSNE_object <- 
+             Rtsne(TMT_assay,
+                   perplexity = TMT_assay %>% #no bigger than 3*perplexity < nrow(X)-1
+                     nrow() %>%
+                     sqrt() %>%
+                     floor(),
+                   max_iter = 5000,
+                   theta = 0.1,
+                   check_duplicates = FALSE, #keeping them to have same nrow in tsne_object and assay()
+                   pca = TRUE,
+                   dims = 2,
+                   verbose = TRUE,
+                   num_threads = 0)
+           
+           #dataframe combining PSM information, TMT data, and tSNE coordinates
+           df_psm_tSNE <- cbind(obj %>% rowData() %>% as.data.frame(),
+                                obj %>% assay() %>% as.data.frame(),
+                                tSNE_object[["Y"]] %>% as.data.frame() %>% setNames(c("tSNE.Dim.1",
+                                                                                      "tSNE.Dim.2")))
+           
+           list <- list(df_psm_tSNE = df_psm_tSNE,
+                        tSNE_object = tSNE_object)
+           
+           return(list)
+         }) %>% 
+  set_names(nm_iter)
+
+#exporting the tSNE set as RDS file to avoid re-running the analysis each time
+saveRDS(Expal_psms_norm_tSNE_objects, file = "files/Expal_psms_norm_tSNE_theta01.RDS")
+
+#save psm tSNE plots
+pdf(file = "graphs/Expal_psm_tSNE_maps.pdf", width = 11, height = 8)
+lapply(X = names(Expal_psms_norm_tSNE_objects),
+       FUN = function(i) {
+         
+         #get object
+         obj <- Expal_psms_norm_tSNE_objects[[i]][["df_psm_tSNE"]]
+         
+         plot <- 
+           obj %>% 
+           ggplot(aes(x = tSNE.Dim.1,
+                      y = tSNE.Dim.2)) +
+           geom_point(alpha = 0.1,
+                      color = "dodgerblue4") +
+           theme_bw() +
+           ggtitle(label = paste("psm_norm tSNE projection ",
+                                 i,
+                                 ": N = ",
+                                 nrow(obj),
+                                 sep = ""))
+         return(plot)
+       })
+dev.off()
+
+#Adding psm tSNE coordinates to ls_QFeat object for the three base dataset
+ls_QFeat <- 
+  lapply(X = names(ls_QFeat),
+         FUN = function(i){
+           
+           #get object tSNE coordinates and turn into DataFrame
+           tSNE_coord <-
+             Expal_psms_norm_tSNE_objects[[i]][["df_psm_tSNE"]] %>%
+             select(tSNE.Dim.1, tSNE.Dim.2) %>% 
+             DataFrame()           
+           
+           #define ls_QFeat set to use for tSNE coordinate addition
+           QFeat_set <- ls_QFeat[[i]]
+           
+           #add tSNE coordinates as new columns in rowData of QFeatures psms_norm_imp layer
+           rowData(QFeat_set) <- List(psms_norm = tSNE_coord)
+           
+           return(QFeat_set)
+           
+         }) %>% 
+  set_names(nm_iter)
+saveRDS(ls_QFeat, file = "files/Expal_QFeat_aggreg_aggvar_tSNE.psm.RDS")
+```
+
+
+```{r create t-SNE coordinates for peptide level data}
+#read RDS file containing the psm tSNE objects
+#Expal_peptide_tSNE_objects <- readRDS(file = "files/Expal_peptide_tSNE_theta01.RDS")
+
+#create tSNE maps for psm level across individual datasets
+Expal_peptide_tSNE_objects <- 
+  lapply(X = names(ls_QFeat),
+         FUN = function(i){
+           
+           #get object
+           obj <- ls_QFeat[[i]][["pep_norm"]]
+           
+           #select relevant data
+           df_pep <-
+             cbind(obj %>% rowData() %>% as.data.frame() %>%
+                     select("Master.Protein.Accessions",
+                            "Number.of.Proteins",
+                            "Protein.Accessions",
+                            "Sequence",
+                            ".n",
+                            "pep.profile.stdev",
+                            "pep.aggv.dist.mean",
+                            "pep.aggv.dist.max",
+                            "pep.nb.feats",
+                            "pep.mean.SPS.MM"),
+                   obj %>% assay() %>% as.data.frame())
+           
+#note that there are expected duplicates in the psm quantitation data and we keep them, but will set check_duplicates = FALSE in the rtsne run
+           TMT_assay <- obj %>% assay()
+           
+           #seed for reproducibility
+           set.seed(117)
+           
+           #generate tSNE object
+           tSNE_object <- 
+             Rtsne(TMT_assay,
+                   perplexity = TMT_assay %>% #no bigger than 3*perplexity < nrow(X)-1
+                     nrow() %>%
+                     sqrt() %>%
+                     floor(),
+                   max_iter = 5000,
+                   theta = 0.1,
+                   check_duplicates = FALSE, #keeping them to have same nrow in tsne_object and assay()
+                   pca = TRUE,
+                   dims = 2,
+                   verbose = TRUE,
+                   num_threads = 0)
+           
+           #dataframe combining peptide information, TMT data, and tSNE coordinates
+           df_pep_tSNE <- cbind(df_pep,
+                                tSNE_object[["Y"]] %>%
+                                  as.data.frame() %>% setNames(c("tSNE.Dim.1",
+                                                                 "tSNE.Dim.2")))
+           
+           list <- list(df_pep_tSNE = df_pep_tSNE,
+                        tSNE_object = tSNE_object)
+           
+           return(list)
+         }) %>% 
+  set_names(nm_iter)
+
+#exporting the tSNE set as RDS file to avoid re-running the analysis each time
+saveRDS(Expal_peptide_tSNE_objects, file = "files/Expal_peptide_tSNE_theta01.RDS")
+
+#save peptide tSNE plots
+pdf(file = "graphs/Expal_peptide_tSNE_maps.pdf", width = 11, height = 8)
+lapply(X = names(Expal_peptide_tSNE_objects),
+       FUN = function(i) {
+         
+         #get object
+         obj <- Expal_peptide_tSNE_objects[[i]][["df_pep_tSNE"]]
+         
+         plot <- 
+           obj %>% 
+           ggplot(aes(x = tSNE.Dim.1,
+                      y = tSNE.Dim.2)) +
+           geom_point(alpha = 0.1,
+                      color = "dodgerblue4") +
+           theme_bw() +
+           ggtitle(label = paste("peptide tSNE projection ",
+                                 i,
+                                 ": N = ",
+                                 nrow(obj),
+                                 sep = ""))
+         return(plot)
+       })
+dev.off()
+
+#Adding peptide tSNE coordinates to ls_QFeat object for the three base dataset
+ls_QFeat <- 
+  lapply(X = names(ls_QFeat),
+         FUN = function(i){
+           
+           #get object tSNE coordinates and turn into DataFrame
+           tSNE_coord <-
+             Expal_peptide_tSNE_objects[[i]][["df_pep_tSNE"]] %>%
+             select(tSNE.Dim.1, tSNE.Dim.2) %>% 
+             DataFrame()           
+           
+           #define ls_QFeat set to use for tSNE coordinate addition
+           QFeat_set <- ls_QFeat[[i]]
+           
+           #add tSNE coordinates as new columns in rowData of QFeatures peptide layer
+           rowData(QFeat_set) <- List(pep_norm = tSNE_coord)
+           
+           return(QFeat_set)
+           
+         }) %>% 
+  set_names(nm_iter)
+saveRDS(ls_QFeat, file = "files/Expal_QFeat_aggreg_aggvar_tSNE.psm.pep.RDS")
+```
+
+
+```{r Combine all base datasets and create comprehensive ls_QFeat list}
+#ls_QFeat <- readRDS(file = "files/Expal_QFeat_aggreg_aggvar_tSNE.psm.pep.RDS")
+
+#TMT abundance data from proteins in the base datasets - to be used to create combined datasets
+Expal_base_datasets <- 
+  lapply(X = names(ls_QFeat),
+         FUN = function(i) {
+           
+           obj <- ls_QFeat[[i]]
+           
+           Z <- 
+             obj[["prot_norm"]] %>% assay() %>% as.data.frame() %>%
+             rownames_to_column(var = "Master.Protein.Accessions") %>%
+             rename_with(~ paste0(names(ls_QFeat[i]), "_", .x),
+                         .cols = 2:as.numeric(obj %>% assay() %>% ncol()+1L))
+           
+           Y <- 
+             obj[["prot_norm"]] %>% rowData() %>% as.data.frame() %>%
+             select(.n) %>% set_names(paste0(names(ls_QFeat[i]), "_", "n.PSMs"))
+           
+           df <- cbind(Z, Y)
+           
+           return(df)
+         }) %>% 
+  set_names(nm_iter)
+
+#create combined datasets as ls_QFeat objects and add to QFeat_list
+ls_QFeat <- 
+ append(ls_QFeat,
+         list(Expal_4.5 = QF_Expal_4.5 <-
+                 join_all(dfs = Expal_base_datasets[1:2],
+                          by = "Master.Protein.Accessions",
+                          type = "inner") %>%
+                 mutate(Expal_4.5.n.PSMs = select(., ends_with("n.PSMs")) %>% rowSums()) %>%
+                 readQFeatures(quantCols = c(2:13, 15:26),
+                               name = "prot_norm")
+                  ))
+
+nm_all <- names(ls_QFeat)
+
+#check that lengths of the datasets correspond to the TMTplexes used
+for (i in seq(1, length(ls_QFeat))) {
+  paste(names(ls_QFeat[i]),
+        ncol(ls_QFeat[[i]][["prot_norm"]] %>% assay()),
+        sep = ": ") %>% 
+    print()
+}
+
+saveRDS(ls_QFeat, file = "files/Expal_QFeat_all_sets.RDS")
+rm(i, QF_Expal_4.5)
+```
+
+
+```{r TMT channel autocorrelation}
+#Function for computing autocovariance matrix and visualise it by heatmap
+pdf(file = "graphs/autocorrelations.pdf")
+lapply(X = names(ls_QFeat),
+       FUN = function(i) {
+         
+         #get obj
+         obj <- ls_QFeat[[i]][["prot_norm"]] %>% assay() %>% as.matrix()
+         
+         #get expression data
+         Z <- obj %>% as.matrix()
+         
+         #compute auto-covariance matrix
+         Y <- t(obj) %*% obj
+         
+         #define colors
+         clrs <- viridis::viridis(n = 200,
+                                  option = "B")
+         #produce heatmap
+         heat_map <- heatmap(x = Y,
+                             main = i,
+                             col = clrs,
+                             margins = c(15, 10))
+         
+         return(heat_map)
+       })
+dev.off()
+```
+
+
+```{r PCA plots}
+#Perform PCA of the quantitation data and plot the results
+ls_Expal_PCA <-
+  lapply(X = names(ls_QFeat),
+         FUN = function(i) {
+           
+           #get obj
+           obj <- ls_QFeat[[i]][["prot_norm"]] %>% assay()
+           
+           # Produce a PCA object with 10 components
+           Z <- PCA(obj,
+                    ncp = 10,
+                    graph = FALSE)
+           
+           #score plot PCA1 vs PCA2
+           A <- fviz_pca_ind(Z,
+                             repel = TRUE,
+                             axes = c(1, 2),
+                             geom.ind = "point",
+                             col.ind = "black",
+                             alpha.ind = 0.2,
+                             title = i)
+           
+           #Loading plot
+           B <- fviz_pca_var(Z, col.var = "contrib") + theme_bw()
+           
+           #Scree plot
+           C <- fviz_screeplot(Z,
+                               choice = "eigenvalue",
+                               addlabels = TRUE,
+                               ncp = 8)
+           
+           #Contribution of channels to PCA1
+           D <- fviz_contrib(Z, choice = "var", axes = 1)
+           
+           Y <- 
+             plot_grid(A, C,
+                       nrow = 1, ncol = 2,
+                       labels = "AUTO",
+                       greedy = TRUE)
+           
+           items <- list(PCA_object = Z,
+                         PCA_plot = Y)
+           
+           return(items)
+         }) %>% 
+  set_names(nm_all)
+
+#save all plots
+pdf(file = "graphs/PCA_plot_QFeat.pdf", width = 11, height = 8)
+for(i in seq(1, length(ls_Expal_PCA))) {
+  print(ls_Expal_PCA[[i]][["PCA_plot"]])
+}
+dev.off()
+rm(i)
+```
+
+
+```{r t-SNE projection}
+#ls_Expal_tSNE_sets_2D <- readRDS(file = "files/Expal_tSNE_sets_2D.RDS")
+
+#check for presence of proteins with identical quantitation data when including Concatenated Rank 2 (e.g. mass-identical peptides containing Isoleucine vs Leucine)
+ls_Expal_duplicates <-
+  lapply(X = names(ls_QFeat[1:2]),
+         FUN = function(i) {
+
+           #get object
+           obj <- ls_QFeat[[i]][["prot_norm"]] %>% assay()
+
+           Z <-
+             obj[duplicated(obj) | duplicated(obj, fromLast = TRUE), ] %>%
+             as.data.frame() %>%
+             rownames_to_column(var = "Master.Protein.Accessions")
+
+           return(Z)
+         }) %>%
+  set_names(nm_iter)
+
+#display datasets with duplicated lines
+write_excel_csv(x = bind_rows(ls_Expal_duplicates, .id = "Iteration"),
+                file = "files/duplicate_protein_profiles.csv")
+
+rm(ls_Expal_duplicates)
+
+#2D tSNE
+ls_Expal_tSNE_sets_2D <-
+  lapply(X = names(ls_QFeat),
+         FUN = function(i) {
+           
+           #get object
+           obj <- ls_QFeat[[i]][["prot_norm"]]
+           
+           df_prot <-
+             cbind(obj %>% rowData() %>% as.data.frame() %>% select("Master.Protein.Accessions"),
+                   obj %>% assay() %>% as.data.frame())
+
+           TMT_assay <- obj %>% assay()
+           
+           #seed for reproducibility
+           set.seed(117)
+           
+           #run tsne with defined functional parameters
+           tSNE_object <-
+             Rtsne(TMT_assay,
+                   perplexity = TMT_assay %>% #no bigger than 3*perplexity < nrow(X)-1
+                     nrow() %>%
+                     sqrt() %>%
+                     floor(),
+                   max_iter = 5000,
+                   theta = 0.0,    #speed/accuracy trade-off - increase for more speed/less accuracy
+                   pca = TRUE,
+                   check_duplicates = FALSE, #in case there are somehow duplicate protein profiles
+                   dims = 2,
+                   verbose = TRUE,
+                   num_threads = 0)   #number of computer threads available
+           
+           df_prot_tSNE <- cbind(df_prot,
+                                 tSNE_object[["Y"]] %>% as.data.frame() %>%
+                                   setNames(c("tSNE.Dim.1",
+                                              "tSNE.Dim.2")))
+           
+           list <- list(df_prot_tSNE = df_prot_tSNE,
+                        tSNE_object = tSNE_object)
+           
+           return(list)
+         }) %>% 
+  set_names(nm_all)
+
+#saving plots
+pdf(file = "graphs/Expal_tSNE_plots.pdf")
+lapply(X = names(ls_Expal_tSNE_sets_2D),
+       function(i) {
+         
+         obj <- ls_Expal_tSNE_sets_2D[[i]][["df_prot_tSNE"]]
+         
+         Z <- 
+           obj %>% 
+           ggplot(aes(x = tSNE.Dim.1,
+                      y = tSNE.Dim.2)) +
+           geom_point(alpha = 0.4,
+                      color = "dodgerblue4") +
+           theme_bw() +
+           ggtitle(label = paste("tSNE projection Expal:",
+                                 i,
+                                 "N =",
+                                 nrow(obj)))
+       })
+dev.off()
+
+##exporting the tSNE set as RDS file to avoid re-running the analysis each time
+saveRDS(ls_Expal_tSNE_sets_2D, file = "files/Expal_tSNE_sets_2D.RDS")
+```
+
+
+```{r alternative tSNE projections}
+set <- ls_QFeat[1:3]
+nm_set <- names(set)
+
+ls_Expal_tSNE_sets_2D_alt <-
+  lapply(X = names(set),
+         FUN = function(i) {
+           
+           #get object
+           obj <- set[[i]][["prot_norm"]]
+           
+           df_prot <-
+             cbind(obj %>% rowData() %>% as.data.frame() %>%
+                     select("Master.Protein.Accessions"),
+                   obj %>% assay() %>% as.data.frame())
+
+           TMT_assay <- obj %>% assay()
+           
+           #seed for reproducibility
+           set.seed(117)
+           
+           #run tsne with defined functional parameters
+           tSNE_object <-
+             Rtsne(TMT_assay,
+                   perplexity = 40,
+                   max_iter = 5000,
+                   theta = 0.0,   #speed/accuracy trade-off - increase for more speed/less accuracy
+                   pca = TRUE,
+                   check_duplicates = FALSE, #in case there are somehow duplicate protein profiles
+                   dims = 2,
+                   verbose = TRUE,
+                   num_threads = 0)   #number of computer threads available
+           
+           df_prot_tSNE <- cbind(df_prot,
+                                 tSNE_object[["Y"]] %>% as.data.frame() %>% setNames(c("tSNE.Dim.1",
+                                                                                       "tSNE.Dim.2")))
+           
+           list <- list(df_prot_tSNE = df_prot_tSNE,
+                        tSNE_object = tSNE_object)
+           
+           return(list)
+         }) %>% 
+  set_names(nm_set)
+
+#saving plots
+pdf(file = "graphs/Expal_tSNE_p40.pdf")
+lapply(X = names(ls_Expal_tSNE_sets_2D_alt),
+       function(i) {
+         
+         obj <- ls_Expal_tSNE_sets_2D_alt[[i]][["df_prot_tSNE"]]
+         
+         Z <- 
+           obj %>% 
+           ggplot(aes(x = tSNE.Dim.1,
+                      y = tSNE.Dim.2)) +
+           geom_point(alpha = 0.4,
+                      color = "dodgerblue4") +
+           theme_bw() +
+           ggtitle(label = paste("tSNE projection:",
+                                 i,
+                                 "N =",
+                                 nrow(obj)))
+       })
+dev.off()
+
+saveRDS(ls_Expal_tSNE_sets_2D_alt, file = "files/Expal_tSNE_p40_2D.RDS")
+```
+
+
+```{r alternative tSNE projections 3D}
+#set <- ls_QFeat[1]
+#nm_set <- names(set)
+
+#ls_Expal_tSNE_sets_3D_alt <-
+#  lapply(X = names(set),
+#         FUN = function(i) {
+           
+#           #get object
+#           obj <- set[[i]][["prot_norm"]]
+#           
+#           df_prot <-
+#             cbind(obj %>% rowData() %>% as.data.frame() %>%
+#                     select("Master.Protein.Accessions"),
+#                   obj %>% assay() %>% as.data.frame())
+
+#           TMT_assay <- obj %>% assay()
+           
+#           #seed for reproducibility
+#           set.seed(117)
+           
+#           #run tsne with defined functional parameters
+#           tSNE_object <-
+#             Rtsne(TMT_assay,
+#                   perplexity = 40,
+#                   max_iter = 5000,
+#                   theta = 0.0,   #speed/accuracy trade-off - increase for more speed/less accuracy
+#                   pca = TRUE,
+#                   check_duplicates = FALSE, #in case there are somehow duplicate protein profiles
+#                   dims = 3,
+#                   verbose = TRUE,
+#                   num_threads = 0)   #number of computer threads available
+           
+#           df_prot_tSNE <- cbind(df_prot,
+#                                 tSNE_object[["Y"]] %>% as.data.frame() %>%
+#                                   setNames(c("tSNE.Dim.1",
+#                                              "tSNE.Dim.2", "tSNE.Dim.3")))
+           
+#           list <- list(df_prot_tSNE = df_prot_tSNE,
+#                        tSNE_object = tSNE_object)
+           
+#           return(list)
+#         }) %>% 
+#  set_names(nm_set)
+
+
+#saveRDS(ls_Expal_tSNE_sets_3D_alt, file = "files/Expal_tSNE_p40_3D.RDS")
+```
+
+
+```{r UMAP projection}
+#ls_Expal_umap_sets_2D <- readRDS(file = "files/Expal_umap_sets_2D.RDS")
+
+#2D UMAPS
+ls_Expal_umap_sets_2D <-
+  lapply(X = names(ls_QFeat),
+         FUN = function(i) {
+           
+           #get object
+           obj <- ls_QFeat[[i]][["prot_norm"]]
+           
+           df_prot <-
+             cbind(obj %>% rowData() %>% as.data.frame() %>%
+                     select("Master.Protein.Accessions"),
+                   obj %>% assay() %>% as.data.frame())
+
+           TMT_assay <- obj %>% assay()
+
+           #run umap with defined functional parameters
+           umap_object <-
+             umap(d = TMT_assay,
+                  n_neighbors = TMT_assay %>%
+                    nrow() %>%
+                    sqrt() %>%
+                    floor(),
+                  metric = "euclidean",
+                  n_epochs = 5000,
+                  input = "data",
+                  random_state = 79,
+                  preserve.seed = TRUE,
+                  n_components = 2,
+                  verbose = TRUE)
+           
+           df_prot_umap <-
+             cbind(df_prot,
+                   umap_object[["layout"]] %>% as.data.frame() %>% setNames(c("umap.Dim.1",
+                                                                              "umap.Dim.2")))
+           
+           list <- list(df_prot_umap = df_prot_umap,
+                        umap_object = umap_object)
+           
+           return(list)
+           
+         }) %>% 
+  set_names(nm_all)
+
+pdf(file = "graphs/Expal_umap_plots.pdf")
+lapply(X = names(ls_Expal_umap_sets_2D),
+       function(i) {
+         
+         obj <- ls_Expal_umap_sets_2D[[i]][["df_prot_umap"]]
+         
+         Y <-
+           obj %>% 
+           ggplot(aes(x = umap.Dim.1,
+                      y = umap.Dim.2)) +
+           geom_point(alpha = 0.4,
+                      color = "dodgerblue4") +
+           theme_bw() +
+           ggtitle(label = paste("UMAP projection Expal6:",
+                                 i,
+                                 "N =",
+                                 nrow(obj)))
+       })
+dev.off()
+
+##exporting the umap set as RDS file to avoid re-running the analysis each time
+saveRDS(ls_Expal_umap_sets_2D, file = "files/Expal_umap_sets_2D.RDS")
+```
+
+
+```{r alternative UMAP projection 3D}
+#set <- ls_QFeat[1]
+#nm_set <- names(set)
+
+##3D UMAPS
+#ls_Expal_umap_sets_3D <-
+#  lapply(X = names(set),
+#         FUN = function(i) {
+#           
+#           #get object
+#           obj <- set[[i]][["prot_norm"]]
+#           
+#           df_prot <-
+#             cbind(obj %>% rowData() %>% as.data.frame() %>%
+#                     select("Master.Protein.Accessions"),
+#                   obj %>% assay() %>% as.data.frame())
+
+#           TMT_assay <- obj %>% assay()
+
+           #run umap with defined functional parameters
+#           umap_object <-
+#             umap(d = TMT_assay,
+#                  n_neighbors = TMT_assay %>%
+#                    nrow() %>%
+#                    sqrt() %>%
+#                    floor(),
+#                  metric = "euclidean",
+#                  n_epochs = 5000,
+#                  input = "data",
+#                  random_state = 79,
+#                  preserve.seed = TRUE,
+#                  n_components = 3,
+#                  verbose = TRUE)
+#           
+#           df_prot_umap <-
+#             cbind(df_prot,
+#                   umap_object[["layout"]] %>% as.data.frame() %>%
+#                     setNames(c("umap.Dim.1",
+#                                "umap.Dim.2",
+#                                "umap.Dim.3")))
+#           
+#           list <- list(df_prot_umap = df_prot_umap,
+#                        umap_object = umap_object)
+#           
+#           return(list)
+#           
+#         }) %>% 
+#  set_names(nm_set)
+
+##exporting the umap set as RDS file to avoid re-running the analysis each time
+#saveRDS(ls_Expal_umap_sets_3D, file = "files/Expal_umap_ETR3R4_3D.RDS")
+```
+
+
+```{r HDBSCAN}
+library(reticulate)
+py_config()
+py_install("hdbscan")
+
+#import hdbscan python module using reticulate
+hdb <- import("hdbscan")
+ 
+
+ #list for the results of HDBSCAN clustering
+ ls_Expal_hdb_vector <-
+   vector(mode = "list",
+         length = length(ls_QFeat)) %>%
+   set_names(nm_all)
+
+ #create assay dataframe list
+ Expal_TMT_datasets <- 
+   lapply(X = names(ls_QFeat),
+          FUN = function(i){
+            
+            obj <- ls_QFeat[[i]][["prot_norm"]] %>% assay() %>% as.data.frame()
+            
+            return(obj)
+          }) %>%
+   set_names(nm_all)
+ 
+ 
+ #hdbscan clustering of data. Tree cut method is switched to 'leaf' (the default is 'eom'); #min_samples and min_cluster_size are tuned separately
+ for (i in seq_along(Expal_TMT_datasets)) {
+   
+   #generate a clusterer object
+   clusterer <- hdb$HDBSCAN(algorithm = 'best',
+                            allow_single_cluster = FALSE,
+                            prediction_data = TRUE,
+                            alpha = 1.0, # Higher value = larger, sparser clusters
+                            approx_min_span_tree = TRUE,
+                            cluster_selection_method = 'leaf',
+                            core_dist_n_jobs = as.integer(4),
+                            gen_min_span_tree = TRUE,
+                            leaf_size = as.integer(5),
+                            match_reference_implementation = FALSE,
+                            metric = 'euclidean',
+                            min_cluster_size = as.integer(5), # Smallest no. points per cluster
+                            min_samples = as.integer(5),      # Higher value = more sparse
+                            cluster_selection_epsilon = 0)      
+   
+   #extract the normalised intensity values
+   data <- Expal_TMT_datasets[[i]] %>% as.matrix()
+   
+   #fit the clusterer object
+   ls_Expal_hdb_vector[[i]] <- clusterer$fit(X = data)
+   
+   #summary of cluster persistence scores - cluster stability over all distance scales (scale #from 0-1)
+   cat(sprintf("Summary statistics for cluster persistence scores in %s data\n",
+               names(Expal_TMT_datasets[i])))
+   print(summary(ls_Expal_hdb_vector[[i]]$cluster_persistence_))
+   
+   #print sum cluster persistence scores
+   cat(sprintf("Sum (n = %s): %s\n\n", 
+               length(ls_Expal_hdb_vector[[i]]$cluster_persistence_), 
+               sum(ls_Expal_hdb_vector[[i]]$cluster_persistence_)))
+ }
+ rm(i, clusterer, data, hdb)
+```
+
+```{r adding projection data to ls_QFeat protein layer}
+#ls_QFeat <- readRDS(file = "files/Expal_QFeat_all_sets.RDS")
+
+ls_QFeat <- 
+  lapply(X = names(ls_QFeat),
+         FUN = function(i){
+           
+           #PCA data
+           #number of PCs with Eigenvalue > 1
+           n_eigenvalue <- 
+             ls_Expal_PCA[[i]][["PCA_object"]][["eig"]] %>% as.data.frame() %>%
+             filter(eigenvalue > 1) %>% nrow()
+           
+           vector <- c(1:n_eigenvalue)
+           
+           #get object PCA dimensions
+           PCA_coord <- 
+             ls_Expal_PCA[[i]][["PCA_object"]][["ind"]][["coord"]] %>%
+             as.data.frame() %>% select(all_of(vector)) %>% 
+             setNames(c(paste("PCA", "Dim", seq(vector), sep = "." )))
+           
+           #tSNE coordinates
+           tSNE_coord_2D <-
+             ls_Expal_tSNE_sets_2D[[i]][["df_prot_tSNE"]] %>%
+             select(tSNE.Dim.1, tSNE.Dim.2) 
+           
+           #tSNE coordinates
+           tSNE_coord_2D_alt <-
+             ls_Expal_tSNE_sets_2D_alt[[i]][["df_prot_tSNE"]] %>%
+             select(tSNE.Dim.1, tSNE.Dim.2) 
+
+           #umap coordinates
+           umap_coord_2D <-
+             ls_Expal_umap_sets_2D[[i]][["df_prot_umap"]] %>%
+             select(umap.Dim.1, umap.Dim.2)
+           
+            #hdbscan data
+            #get HDBSCAN results
+            hdb_results <- ls_Expal_hdb_vector[[i]]
+            
+            #get cluster labels
+            clusters <- hdb_results$labels_ + 1L %>% as.numeric()
+            clusters <- clusters %>% as.data.frame() %>% setNames("HDBSCAN.cluster")
+            
+            #get cluster probabilities
+            probs <- hdb_results$probabilities_ %>% as.numeric()
+            probs <- probs %>% as.data.frame() %>% setNames("HDBSCAN.cluster.prob")
+           
+            #get outlier probabilities
+            outliers <- hdb_results$outlier_scores_ %>% as.numeric()
+            outliers <- outliers %>% as.data.frame() %>% setNames("HDBSCAN.outlier.score")
+           
+            #create DFrame
+            hdbscan_data <-
+              cbind(clusters,
+                    probs,
+                    outliers)
+           
+           #DataFrames to add
+           data <- DataFrame(PCA_coord,
+                             tSNE_coord_2D,
+                             tSNE_coord_2D_alt,
+                             umap_coord_2D,
+                             hdbscan_data)
+           
+           #define ls_QFeat set to use
+           QFeat_set <- ls_QFeat[[i]]
+           
+           #add data in protein layer as new rowData
+           rowData(QFeat_set) <- List(prot_norm = data)
+           
+           return(QFeat_set)
+           
+         }) %>% 
+  set_names(nm_all)
+```
+
+
+```{r adding custom map data for ETR3R4 map}
+
+#df_tSNE_coord_2D_alt <-
+#  ls_Expal_tSNE_sets_2D_alt[["Expal6"]][["tSNE_object"]][["Y"]] %>%
+#  as.data.frame() %>%
+#  setNames(c(paste("tSNE.2D.p40.Dim.1"),
+#             paste("tSNE.2D.p40.Dim.2")))
+
+#df_tSNE_coord_3D_alt <-
+#  ls_Expal_tSNE_sets_3D_alt[["Expal6"]][["tSNE_object"]][["Y"]] %>%
+#  as.data.frame() %>%
+#  setNames(c(paste("tSNE.3D.p40.Dim.1"),
+#             paste("tSNE.3D.p40.Dim.2"),
+#             paste("tSNE.3D.p40.Dim.3")))
+            
+#df_umap_coord_3D <-
+#  ls_Expal_umap_sets_3D[["Expal6"]][["umap_object"]][["layout"]] %>%
+#  as.data.frame() %>%
+#  setNames(c(paste("umap.3D.Dim.1"),
+#             paste("umap.3D.Dim.2"),
+#             paste("umap.3D.Dim.3")))
+
+#DataFrames to add
+#ETR3R4_custom_data <- 
+#  DataFrame(df_tSNE_coord_2D_alt,
+#            df_tSNE_coord_3D_alt,
+#            df_umap_coord_3D)
+
+#add data in protein layer as new rowData
+#rowData(ls_QFeat[["Expal6"]]) <- List(prot_norm = ETR3R4_custom_data)
+
+
+##exporting final ls_QFeat as RDS file to avoid re-running the analysis each time
+#saveRDS(ls_QFeat, file = "files/Expal_QFeat_final.RDS")
+
+
+#rm(df_tSNE_coord_2D_alt, df_tSNE_coord_3D_alt, df_umap_coord_3D, ETR3R4_custom_data)
+```
+
+
+```{r individual and master file protein data}
+#ls_QFeat <- readRDS(file = "files/Expal_QFeat_final.RDS")
+
+ls_output_1 <- 
+  lapply(X = names(ls_QFeat[1:3]),
+         FUN = function(i) {
+           
+           #binding selected rowData and assay
+           df <-
+             cbind(
+               ls_QFeat[[i]][["prot_norm"]] %>% rowData() %>%
+                 as.data.frame() %>%
+                 select(contains(match = c("Master.Protein.Accessions",
+                                           "Quality.Tier", "prot.",
+                                           "PCA", "tSNE", "umap", "HDBSCAN"),
+                                 ignore.case = FALSE)),
+               ls_QFeat[[i]][["prot_norm"]] %>%
+                 assay() %>% as.data.frame())
+           
+           #adding set name to a few columns
+           for (col in 2:length(df)){
+             colnames(df)[col] <- paste(i, colnames(df)[col], sep = ".")
+           }
+ 
+           return(df)
+         }) %>% 
+  set_names(nm_all[1:3])
+
+#ls_output_2 <- 
+#  lapply(X = names(ls_QFeat[4:7]),
+#         FUN = function(i) {
+#           
+#           #rowData
+#           df <-
+#             cbind(
+#               ls_QFeat[[i]][["prot_norm"]] %>% rowData() %>%
+#                 as.data.frame() %>%
+#                 select(contains(match = c("Master.Protein.Accessions",
+#                                           "PCA", "tSNE", "umap", "HDBSCAN"),
+#                                 ignore.case = FALSE)),
+#               ls_QFeat[[i]][["prot_norm"]] %>%
+#                 assay() %>% as.data.frame())
+#           
+#           
+#           #adding set name to a few columns
+#           for (col in 2:ncol(df)){
+#             colnames(df)[col] <- paste(i, colnames(df)[col], sep = ".")
+#           }
+#           
+#           return(df)
+#         }) %>% 
+#  set_names(nm_all[4:7])
+#
+# ls_output <- append(ls_output_1,
+#                     ls_output_2)
+
+ls_output <- ls_output_1
+
+rm(ls_output_1)
+
+#write data from output object into individual csv files
+invisible(lapply(X = names(ls_output),
+                 FUN = function(i) {
+                   
+                   #write output table
+                   write_excel_csv(x = ls_output[[i]], 
+                                   file = paste0("files/dataset_", i, "_protein.csv"),
+                                   delim = ",")
+                 }))
+
+#join all dataframes
+Expal_complete <-
+  join_all(dfs = ls_output, by = "Master.Protein.Accessions", type = "full")
+
+#add annotations
+annotations <- read_tsv("/wallerlab/storage/bj328/LOPIT/Markers/refseq_Aip1.1.fun_annotation.tsv")
+
+#join annotations and markers
+Expal_complete_annotated <- Expal_complete %>%
+  left_join(annotations, by = "Master.Protein.Accessions")
+
+#output vectors
+output_comb <- paste(rep(nm_all, each = 4), c("PCA", "tSNE", "umap", "HDBSCAN"), sep = ".")
+
+#save master files
+write_excel_csv(x = Expal_complete,
+                file = paste0("files/Master_File_complex_", format(Sys.Date(), "%d%m%Y"), ".csv"))
+write_excel_csv(x = Expal_complete_annotated,
+                file = paste0("files/Master_File_complex_annotated_", format(Sys.Date(), "%d%m%Y"), ".csv"))
+
+rm(output_comb)
+```
+
+
+```{r individual files for quality control and protein composition}
+#ls_QFeat <- readRDS(file = "files/Expal6_QFeat_proteins_final.RDS")
+
+#ls_Exp_data <- 
+#    lapply(X = names(ls_QFeat[1]),
+#           FUN = function(i) {
+             
+             #get object
+#             obj <- ls_QFeat[[i]]
+             
+             #aggvar amd tSNE data for all levels
+#             psm_data <-
+#               cbind(obj[["psms_norm"]] %>% rowData() %>% as.data.frame(),
+#                     obj[["psms_norm"]] %>% assay())
+
+#             peptide_data <- 
+#               obj[["pep_norm"]] %>% rowData() %>% as.data.frame() %>%
+#               select(Master.Protein.Accessions,
+#                      Sequence,
+#                      starts_with("Quality"),
+#                      ends_with(".nb.feats"),
+#                      starts_with(c("pep.", "tSNE")))
+
+#             protein_data <- 
+#               obj[["prot_norm"]] %>% rowData() %>% as.data.frame() %>% 
+#               select(Master.Protein.Accessions,
+#                      starts_with("Quality"),
+#                      ends_with(".nb.feats"),
+#                      starts_with("prot."),
+#                      contains(c("PCA", "tSNE", "umap", "HDBSCAN"))) 
+
+             #serial joining of all three data layers
+#             df <- 
+#               left_join(x = psm_data,
+#                         y = peptide_data,
+#                         by = c("Master.Protein.Accessions", "Sequence"),
+#                         suffix = c(".psm", ".pep")) %>% 
+#               left_join(x = .,
+#                         y = protein_data,
+#                         by = "Master.Protein.Accessions",
+#                         suffix = c(".pep", ".prot")) %>%         
+#               arrange(Master.Protein.Accessions, Sequence)
+             
+#             return(df)
+#           }) %>% 
+#  set_names(nm_iter)
+
+#add annotations
+#annotations <- read_tsv("/wallerlab/storage/bj328/LOPIT/Markers/refseq_Aip1.1.fun_annotation.tsv")
+
+#for (i in seq(1, length(ls_Exp_data)))  {
+#  ls_Exp_data[[i]] <- ls_Exp_data[[i]] %>%
+#    left_join(annotations, by = "Master.Protein.Accessions")
+  
+#  write_excel_csv(x = ls_Exp_data[[i]],
+#                  file = paste("files/",
+#                               names(ls_Exp_data)[i],
+#                               "psm_pep_prot_quality_check.csv"))
+#}
+#rm(i)
+```
+
+
+```{r session info}
+utils::sessionInfo()
+```
+

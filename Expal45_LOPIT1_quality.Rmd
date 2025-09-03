@@ -1,0 +1,1114 @@
+---
+title: "Expal6 analysis: PSM data quality"
+author: "Ben Jenkins"
+date: '2025-07-10'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r libraries}
+library(conflicted)
+library(tidyverse)
+library(scales)
+library(ggforce)
+library(eulerr)
+library(cowplot)
+library(ggrepel)
+library(FactoMineR)
+library(factoextra)
+library(naniar)
+library(QFeatures)
+library(VIM)
+
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::count)
+conflicts_prefer(dplyr::rename)
+conflicts_prefer(dplyr::mutate)
+conflicts_prefer(dplyr::summarise)
+conflicts_prefer(dplyr::arrange)
+conflicts_prefer(base::as.factor)
+conflicts_prefer(magrittr::set_names)
+```
+
+
+```{r loading + structuring data}
+
+#import PSM file
+df_PSM <- read_delim(file = "/wallerlab/storage/bj328/LOPIT/Expal4_5_ref/Expal45_f_v1_PSMs.txt",
+                     delim = "\t",
+                     na = c("", "NA"),
+                     col_types = NULL,
+                     trim_ws = TRUE) %>% data.frame()
+
+#import protein file
+df_proteins <- read_delim(file = "/wallerlab/storage/bj328/LOPIT/Expal4_5_ref/Expal45_f_v1_Proteins.txt",
+                          delim = "\t",
+                          na = c("", "NA"),
+                          col_types = NULL,
+                          trim_ws = TRUE) %>% data.frame()
+
+
+#creating protein.FDR, ExpSet, and Iteration ID columns
+df_PSM$File.ID %>% unique()
+df_PSM$ExpSet <- case_match(.x = df_PSM$File.ID,
+                            "F1.1" ~ "Expal4",
+                            "F1.2" ~ "Expal4",
+                            "F1.3" ~ "Expal4",
+                            "F1.4" ~ "Expal4",
+                            "F1.5" ~ "Expal4",
+                            "F1.6" ~ "Expal4",
+                            "F1.7" ~ "Expal4",
+                            "F1.8" ~ "Expal4",
+                            "F1.9" ~ "Expal4",
+                            "F1.10" ~ "Expal4",
+                            "F1.11" ~ "Expal4",
+                            "F1.12" ~ "Expal4",
+                            "F1.13" ~ "Expal4",
+                            "F1.14" ~ "Expal4",
+                            "F1.15" ~ "Expal4",
+                            "F2.1" ~ "Expal5",
+                            "F2.2" ~ "Expal5",
+                            "F2.3" ~ "Expal5",
+                            "F2.4" ~ "Expal5",
+                            "F2.5" ~ "Expal5",
+                            "F2.6" ~ "Expal5",
+                            "F2.7" ~ "Expal5",
+                            "F2.8" ~ "Expal5",
+                            "F2.9" ~ "Expal5",
+                            "F2.10" ~ "Expal5",
+                            "F2.11" ~ "Expal5",
+                            "F2.12" ~ "Expal5",
+                            "F2.13" ~ "Expal5",
+                            "F2.14" ~ "Expal5",
+                            "F2.15" ~ "Expal5") %>% 
+  as.factor()
+
+
+df_PSM$Iteration <- case_match(.x = df_PSM$ExpSet,
+                            "Expal4" ~ "Expal4",
+                            "Expal5" ~ "Expal5") %>% as.factor()
+
+
+#adding column with master protein FDR
+df_PSM <- left_join(
+  x = df_PSM,
+  y = df_proteins %>%
+    select(Accession, Protein.FDR.Confidence.Combined) %>%
+    rename(
+      Master.Protein.Accessions = Accession,
+      Protein.FDR.Confid = Protein.FDR.Confidence.Combined
+    ),
+  by = "Master.Protein.Accessions"
+)
+
+
+#creating a unique ID column for each raw PSM entry for later traceability
+df_PSM$PSM.ID <- paste0("PSM#", row.names(df_PSM))
+
+
+#replacing Abundance column names with TMT tag descriptions
+cols_to_modify <- c(47, 48, 49, 50, 51, 52,
+                    53, 54, 55, 56, 57, 58, 
+                    59, 60, 61, 62, 63)
+
+for (i in cols_to_modify){
+  colnames(df_PSM)[i] <- str_remove(colnames(df_PSM)[i], pattern = "Abundance.")
+  } 
+rm(i)
+
+Expal4_cols <- c(47, 48, 49, 50, 51, 52,
+                 53, 54, 55, 56, 57, 58)
+
+Expal5_cols <- c(#47, 
+                 48, 49, 50, 51, 52,
+                 54, 55, 
+                 #56, 57,
+                 59, 60, 61, 62, 63)
+
+#set PSM quality thresholds
+qual_Isol_In <- 75
+qual_SN <- 10
+qual_SPS_Mass_rest <- 50
+qual_SPS_Mass_core <- 70
+
+#set names for datasets and LOPIT iterations
+nm_sets <- c(levels(df_PSM$ExpSet))
+nm_iter <- c(levels(df_PSM$Iteration))
+
+#TMT order
+TMT_order <- c("126", "127N", "127C", "128N", "128C", "129N",
+               "129C", "130N", "130C", "131N", "131C", "132N",
+               "132C", "133N", "133C", "134N", "134C")
+
+
+#creating individual PSM datasets for each ExpSet (all fractions of one MS run)
+ls_Expal_PSM_ExpSet <- 
+  split(x = df_PSM,
+        f = df_PSM$ExpSet) %>% 
+  set_names(nm_sets)
+
+```
+
+
+```{r PSM quality overview}
+
+#overview of PSM quality
+graphs_qual <-
+  lapply(X = names(ls_Expal_PSM_ExpSet),
+         FUN = function(i) {
+           
+           #get object
+           obj <- ls_Expal_PSM_ExpSet[[i]]
+           
+#graphs of interest
+           #time to accumulate precursor ions
+           A <- 
+             ggplot(obj, aes(x = Ion.Inject.Time.in.ms)) +
+             geom_histogram(binwidth = 1, boundary = 0, closed = "left") +
+             theme_bw() +
+             xlab("Ion injection time [ms]")
+           
+           #precursor ion intensity
+           B <- 
+             ggplot(obj, aes(x = Intensity)) +
+             geom_histogram(bins = 100, boundary = 0, closed = "left") +
+             theme_bw() +
+             scale_x_log10(labels = label_log(),
+                           breaks = c(10^4, 10^5, 10^6, 10^7, 10^8, 10^9)) +
+             xlab("Precursor ion intensity")
+           
+           #mass deviation
+           C <- 
+             ggplot(obj, aes(x = Delta.M.in.ppm)) +
+             geom_histogram(binwidth = 1, closed = "left") +
+             geom_vline(xintercept = 0) +
+             scale_x_continuous(breaks = seq(-10, 10, by = 2)) +
+             theme_bw() +
+             xlab("Precursor ion mass deviation [ppm]")
+           
+           #mass deviation over retention time
+           D <- 
+             ggplot(obj, aes(x = RT.in.min,
+                                 y = Delta.M.in.ppm)) +
+             geom_point(size = 0.5, colour = "grey25", alpha = 0.05) +
+             xlim(0, 120) +
+             geom_hline(yintercept = 0, colour = "red") +
+             geom_hline(yintercept = c(-10, 10), colour = "red", linetype = "dashed") +
+             theme_bw() +
+             xlab("Retention time [min]")+
+             ylab("Precursor ion mass deviation [ppm]")
+           
+           #interference in isolation window
+           E <- 
+             ggplot(obj, aes(x = Isolation.Interference.in.Percent)) +
+             geom_histogram(binwidth = 1, boundary = 0, closed = "left") +
+             geom_vline(xintercept = qual_Isol_In,
+                        linetype = "dashed",
+                        colour = "red") +
+             theme_bw() +
+             xlab("Precursor ion isolation interference [%]")
+           
+           #percentage of SPS fragments matched to actual peptide fragments
+           F1 <- 
+             ggplot(obj, aes(x = SPS.Mass.Matches.in.Percent)) +
+             geom_histogram(binwidth = 10, boundary = 0, closed = "left") +
+             geom_vline(xintercept = c(qual_SPS_Mass_rest,
+                                       qual_SPS_Mass_core),
+                        linetype = "dashed",
+                        colour = "red") +
+             scale_x_continuous(breaks = seq(0, 100, by = 10)) +
+             theme_bw() +
+             xlab("SPS Mass match [%]")
+           
+           #signal-to-noise ratio of reporter ions
+           G <- 
+             ggplot(obj, aes(x = Average.Reporter.SN)) +
+             geom_histogram(bins = 100, boundary = 0, closed = "left") +
+             geom_vline(xintercept = qual_SN,
+                        linetype = "dashed",
+                        colour = "red") +
+             theme_bw() +
+             scale_x_log10(labels = label_log()) +
+             annotation_logticks(sides = "b", base = 10) +
+             xlab("Average reporter ion S/N ratio")
+           
+           #average S/N threshold for PSM selection vs signal across channels
+           H <- 
+             obj %>% 
+             pivot_longer(cols = any_of(TMT_order),
+                          names_to = "Tag",
+                          values_to = "Abundance") %>%
+             mutate(Tag = factor(x = Tag, levels = TMT_order)) %>% 
+             ggplot(aes(x = Tag, y = Abundance)) +
+             geom_bin2d(bins = 100, drop = TRUE) +
+             scale_fill_gradient(low = "grey25", high = "white") +
+             theme_bw() +
+             theme(axis.text.x = element_text(angle = 90, vjust = 0.5),
+                   legend.position = "right") +
+             scale_y_log10(labels = label_log(),
+                           breaks = c(0.1, 1, 10, 100, 1000, 10000, 100000)) +
+             xlab("TMT channel") + 
+             ylab("Reporter Ion Abundance [S/N]")
+           
+           #plot all graphs as grid
+           plots <- plot_grid(A, B, C, D, E, F1, G, H,
+                              nrow = 2,
+                              ncol = 4,
+                              labels = "AUTO")
+           
+           #add title to each plot
+           title <- 
+             ggdraw() + 
+             draw_label(label = paste(i,
+                                      "PSMs N =",
+                                      obj %>% nrow(), sep = " "),
+                        fontface = 'bold',
+                        x = 0,
+                        hjust = 0) +
+             theme(plot.margin = margin(0, 0, 0, 7))
+           
+           Z <- 
+             plot_grid(title,
+                       plots,
+                       ncol = 1,
+                       rel_heights = c(0.1, 1))
+           
+           return(Z)
+         }) %>%
+  set_names(nm_sets)
+warnings()
+
+#save PSM quality graphs
+pdf(file = "graphs/ExpSet_PSM_quality.pdf", width = 16, height = 8)
+print(graphs_qual)
+dev.off()
+
+rm(graphs_qual)
+
+```
+
+
+```{r check on channel intensity alignment for Expal}
+#total intensity sums in each channel
+pdf(file = "graphs/raw total_signal.pdf", width = 16)
+lapply(X = names(ls_Expal_PSM_ExpSet),
+       FUN = function(i) {
+         
+         obj <- ls_Expal_PSM_ExpSet[[i]]
+         
+         Z <- 
+           obj %>% 
+           summarise(across(starts_with(TMT_order),
+                            ~ sum(.x, na.rm = TRUE))) %>%
+           pivot_longer(cols = any_of(TMT_order), 
+                        names_to = "TMT.channel",
+                        values_to = "total.intensity") %>% 
+           mutate(TMT.channel = factor(x = TMT.channel,
+                                       levels = TMT_order))
+         
+         plot <- 
+           ggplot(data = Z, aes(x = TMT.channel,
+                                y = total.intensity)) +
+           geom_col() +
+           theme_bw() +
+           xlab("total reporter ion intensity") + 
+           ylab("TMT channel") +
+           labs(title = paste0(i))
+         
+         write.csv(Z, file = paste0("files/total_TMT_intensity_", i, ".csv"), row.names = FALSE)
+         
+         return(plot)
+       })
+dev.off()
+
+##Sample loading normalisation between channels
+#aligning all TMT channels by total intensity within each ExpSet (column sums)
+ls_Expal_PSM_norm_sum <- 
+  lapply(X = names(ls_Expal_PSM_ExpSet),
+         function(i) {
+           
+           #get object
+           obj <- ls_Expal_PSM_ExpSet[[i]]
+
+           #select TMT columns within each experiments for channel normalisation
+           TMT_array <- obj %>% select(any_of(TMT_order))
+           
+           #normalisation factor as grand mean of column sums divided by column sums
+           norm_fac_sum <-
+             mean(apply(X = TMT_array, MARGIN = 2, FUN = sum, na.rm = TRUE))/
+             apply(X = TMT_array, MARGIN = 2, FUN = sum, na.rm = TRUE)
+           
+
+           #Apply the channel scaling factors to the raw data by sweeping out the TMT data array
+           TMT_col_names <- TMT_array %>% colnames() %>% as.vector()
+           
+           obj[ , TMT_col_names] <- sweep(x = obj[ , TMT_col_names],
+                                          MARGIN = 2,
+                                          STATS = norm_fac_sum,
+                                          FUN = "*")
+           
+           
+           return(list(norm_factor = norm_fac_sum,
+                       data = obj))
+         }) %>% 
+  set_names(nm_sets)
+
+
+#violin boxplots of channel-aligned TMT intensities for each ExpSet
+pdf(file = "graphs/Expal_psm_sum-aligned.pdf", width = 11, height = 8)
+lapply(X = names(ls_Expal_PSM_norm_sum),
+       FUN = function(i) {
+         
+         obj <- ls_Expal_PSM_norm_sum[[i]]$data
+         
+         plot <- 
+           obj %>%
+           pivot_longer(cols = any_of(TMT_order), 
+                        names_to = "TMT.channel",
+                        values_to = "abundance") %>%
+           mutate(TMT.channel = factor(x = TMT.channel,
+                                       levels = TMT_order)) %>% 
+           ggplot(aes(x = TMT.channel,
+                      y = log10(abundance))) +
+           geom_violin(trim = FALSE) +
+           geom_boxplot(width = 0.1) +
+           theme_bw() +
+           labs(x = "TMT channel",
+                y = "reporter ion S/N [log10]",
+                title = paste0("channel-intensity-sum-aligned psm intensity ",
+                               i, ": N = ", nrow(obj)))
+
+         return(plot)
+       })
+dev.off()
+
+
+rm(ls_Expal_PSM_norm_sum)
+```
+
+
+
+```{r PSM quality filtering}
+
+ls_QFeat <- list(Expal4 = 
+                   readQFeatures(assayData = df_PSM %>% filter(ExpSet == "Expal4"),
+                                 quantCols = Expal4_cols,
+                                 fnames = "PSM.ID",
+                                 name = "psms_raw"),
+                 Expal5 = 
+                   readQFeatures(assayData = df_PSM %>% filter(ExpSet == "Expal5"),
+                                 quantCols = Expal5_cols,
+                                 fnames = "PSM.ID",
+                                 name = "psms_raw"))
+
+
+#input/loading normalisation between channels
+ls_QFeat <- 
+  lapply(X = names(ls_QFeat),
+         FUN = function(i) {
+           
+           obj <- ls_QFeat[[i]]
+           
+           #select TMT data for channel normalisation
+           TMT_array <- obj %>% assay()
+           
+           #channel normalisation as grand mean of channel sums divided by each channel sum
+           norm_fac_sum <-
+             mean(apply(X = TMT_array, MARGIN = 2, FUN = sum, na.rm = TRUE))/
+             apply(X = TMT_array, MARGIN = 2, FUN = sum, na.rm = TRUE)
+           
+           obj <- 
+             sweep(x = obj,
+                   MARGIN = 2,
+                   STATS = norm_fac_sum,
+                   FUN = "*",
+                   i = "psms_raw", 
+                   name = "psms_input_norm")
+           
+           return(obj)
+           
+         }) %>% 
+  set_names(names(ls_QFeat))
+
+
+
+#Filtering according to uniqueness, labels, rank etc.
+ls_QFeat_filt <- 
+  lapply(X = names(ls_QFeat),
+         FUN = function(i) {
+           
+           obj <- ls_QFeat[[i]]
+           
+           #selecting metadata for each iteration
+           # metadat <- Pbur_metadata %>% filter(Iteration == i)
+           
+           #adding metadata as colData
+           # obj$Iteration <- metadat$Iteration
+           # obj$TMT.channel <- metadat$TMT.channel
+           # obj$peptide.ug <- metadat$peptide.ug
+           # obj$fraction.number <- metadat$fraction.number
+           # obj$fraction.density.Brix <- metadat$fraction.density.Brix
+           # obj$fraction.protein.ug <- metadat$fraction.protein.ug
+           # obj$LOPIT.type <- metadat$LOPIT.type
+           # obj$lysis.pressure.psi <- metadat$lysis.pressure.psi
+           # obj$iodixanol.gradient <- metadat$iodixanol.gradient
+           # obj$buffer <- metadat$buffer
+           # obj$supplements.treatments <- metadat$supplements.treatments
+           
+           #duplicate psm assay to apply later filtering
+           obj <-
+             addAssay(x = obj,
+                      y = obj[["psms_input_norm"]],
+                      name = "psms_filtered") %>% 
+             addAssayLink(object = .,
+                          from = "psms_input_norm",
+                          to = "psms_filtered",
+                          varFrom = "PSM.ID",
+                          varTo = "PSM.ID")
+           
+           #changing all 0s to NA in assay data (in case there are any 0s)
+           obj <- zeroIsNA(object = obj,
+                           i = "psms_filtered")
+           
+           #Filtering according to uniqueness, Rank, protein FDR,PSM quality thresholds
+           #isolation interference, average reporter S/N, and SPS mass match %
+           #final joined sets consist of master accessions made of tier1 proteins (70-100% PSM
+           #SPS mass match %) and tier2 proteins (50-60% PSM SPS mass match %)
+           
+           obj_filt <- 
+             obj %>%
+             filterFeatures(~ !is.na(Master.Protein.Accessions), i = "psms_filtered") %>%
+             filterFeatures(~ Contaminant == "FALSE", i = "psms_filtered") %>% 
+             filterFeatures(~ PSM.Ambiguity == "Unambiguous", i = "psms_filtered") %>% 
+             filterFeatures(~ Quan.Info != "NoQuanLabels", i = "psms_filtered") %>% 
+             filterFeatures(~ Rank == 1, i = "psms_filtered") %>% 
+             filterFeatures(~ Search.Engine.Rank == 1, i = "psms_filtered") %>% 
+             filterFeatures(~ Number.of.Protein.Groups == 1, i = "psms_filtered") %>% 
+             filterFeatures(~ Number.of.Proteins == 1, i = "psms_filtered") %>%
+             filterFeatures(~ Confidence == "High", i = "psms_filtered") %>% 
+             filterFeatures(~ Protein.FDR.Confid == "High" 
+                            #|
+                              #Protein.FDR.Confid == "Medium"
+                            , i = "psms_filtered") %>% 
+             filterFeatures(~ Isolation.Interference.in.Percent <= 75,
+                            na.rm = TRUE, i = "psms_filtered") %>% 
+             filterFeatures(~ Average.Reporter.SN >= 10,
+                            na.rm = TRUE, i = "psms_filtered") %>% 
+             filterFeatures(~ SPS.Mass.Matches.in.Percent >= 50,
+                            na.rm = TRUE, i = "psms_filtered")
+           
+           #defining "core" protein accession numbers, i.e. with mass match >= 70%
+           tier1_accessions <- 
+             obj_filt[["psms_filtered"]] %>% rowData() %>% as.data.frame() %>%
+             filter(SPS.Mass.Matches.in.Percent >= 70) %>%
+             pull(Master.Protein.Accessions) %>% unique()
+           
+           #defining "rest" protein accession numbers, i.e. with mass match 50-60%
+           tier2_accessions <- 
+             obj_filt[["psms_filtered"]] %>% rowData() %>% as.data.frame() %>%
+             filter(between(SPS.Mass.Matches.in.Percent, left = 50, right = 60)) %>%
+             filter(!Master.Protein.Accessions %in% tier1_accessions) %>%
+             pull(Master.Protein.Accessions) %>% unique()
+           
+           pdf(file = paste0("graphs/", "tier1_tier2_", i, ".pdf"))
+           print(plot(x = euler(list("SPS.MM: >70" = tier1_accessions,
+                                     "SPS.MM: 50-60" = tier2_accessions)),
+                      quantities = TRUE,
+                      fills = c("#E69F00", "#009E73"),
+                      alpha = 1,
+                      main = i))
+           dev.off()
+           
+           #PSM.IDs for filtering tier1 and tier2 entries
+           tier1_PSM.IDs <- 
+             obj_filt[["psms_filtered"]] %>% rowData() %>% as.data.frame() %>%
+             filter(SPS.Mass.Matches.in.Percent >= 70) %>%
+             pull(PSM.ID)
+           
+           tier2_PSM.IDs <- 
+             obj_filt[["psms_filtered"]] %>% rowData() %>% as.data.frame() %>%
+             filter(between(SPS.Mass.Matches.in.Percent, left = 50, right = 60)) %>%
+             filter(!Master.Protein.Accessions %in% tier1_accessions) %>%
+             pull(PSM.ID)
+           
+           #adding another assay layer, filtered for SPS.Mass.Match.in.Percent
+           obj_filt2 <- 
+             addAssay(x = obj_filt,
+                      y = subsetByRow(obj_filt, c(tier1_PSM.IDs,
+                                                  tier2_PSM.IDs))[["psms_filtered"]],
+                      name = "psms_SPS.MM_filtered") %>% 
+             addAssayLink(object = .,
+                          from = "psms_filtered",
+                          to = "psms_SPS.MM_filtered",
+                          varFrom = "PSM.ID",
+                          varTo = "PSM.ID")    
+           
+           quality.tier <- 
+             rowData(obj_filt2[["psms_SPS.MM_filtered"]]) %>% as.data.frame() %>%
+             select(PSM.ID) %>% 
+             mutate(Quality.Tier = 
+                      case_when(PSM.ID %in% tier1_PSM.IDs ~ "tier1",
+                                PSM.ID %in% tier2_PSM.IDs ~ "tier2")) %>% 
+             select(Quality.Tier)
+           
+           rowData(obj_filt2[["psms_SPS.MM_filtered"]])$Quality.Tier <- quality.tier
+           
+           return(obj_filt2)
+           
+         }) %>% 
+  set_names(nm_iter)
+
+```
+
+
+```{r Euler diagram}
+##Euler diagram of accession numbers between datasets
+ls_Euler <-
+  list(Expal4 =
+          rowData(ls_QFeat_filt[["Expal4"]][["psms_SPS.MM_filtered"]])$Master.Protein.Accessions %>% unique(),
+       Expal5 =
+          rowData(ls_QFeat_filt[["Expal5"]][["psms_SPS.MM_filtered"]])$Master.Protein.Accessions  %>% unique())
+
+pdf(file = "graphs/Euler_proteins_quality_filtered.pdf")
+plot(euler(ls_Euler),
+     quantities = TRUE,
+     fills = c("#E69F00", "#009E73", "#CC79A7"),
+     alpha = 1)
+dev.off()
+
+rm(ls_Euler)
+```
+
+
+```{r Missing value pattern 1}
+#Global missing data pattern
+pdf(file = "graphs/MV_global_pattern.pdf", width = 11, height = 8)
+lapply(X = names(ls_QFeat_filt),
+       function(i){
+         #get object
+         obj <- ls_QFeat_filt[[i]][["psms_SPS.MM_filtered"]]
+         
+         #keep only rows with missing data
+         Z <- 
+           obj %>%
+           assay %>% as.data.frame() %>% 
+           filter(rowSums(is.na(.)) != 0)
+         
+         #aggregation plot for missing values
+         Y <- 
+           aggr(Z,
+                plot = TRUE,
+                numbers = TRUE,
+                prop = FALSE,
+                combined = TRUE,
+                cex.numbers = 0.3,
+                varheight = TRUE)
+         title(main = i,
+               outer = FALSE)
+         
+         #plot of missing value combinations across channels
+         X <- print(gg_miss_upset(Z,
+                                  nsets = ncol(Z),
+                                  nintersects = 20))
+         
+         #combine both plots in a list
+         W <- list(Y, X)
+         
+         return(W)
+       })
+dev.off()
+```
+
+
+```{r Missing value pattern 2}
+
+#Overview of the proportion of missing channels per PSM
+pdf(file = "graphs/MV_missing_channels_pie.pdf")
+lapply(X = names(ls_QFeat_filt),
+       FUN = function(i) {
+         
+         #get object  
+         obj <- ls_QFeat_filt[[i]][["psms_SPS.MM_filtered"]]
+         
+         #dataframe showing the frequency of missing value occurrences
+         Z <- 
+           nNA(obj) %>% .$nNArows %>% .$nNA %>% table() %>% 
+           as.data.frame() %>%
+           setNames(c("No.of.missing.channels", "Count"))
+         
+         #pie chart of occurrence of missing channels
+         Y <-
+           Z %>% 
+           ggplot(aes(x = "No.of.missing.channels",
+                      y = Count,
+                      fill = No.of.missing.channels)) +
+           geom_bar(position = "stack",
+                    stat = "identity") +
+           coord_polar(theta = "y",
+                        start = 0,
+                        direction = -1)+
+           scale_fill_brewer(palette = "Paired",
+                             direction = 1) +
+           ggtitle(label = "Number of missing channels (PSM level)", i) +
+           theme_void()
+         
+         return(Y)
+       })
+dev.off()
+
+#Overview of how many PSMs have how many missing TMT channels 
+pdf(file = "graphs/MV_channel_wise.pdf", width = 16)
+lapply(X = names(ls_QFeat_filt),
+       FUN = function(i) {
+         
+         #get object  
+         obj <- ls_QFeat_filt[[i]][["psms_SPS.MM_filtered"]]
+         
+         #Pattern of missing PSMs per channel
+         A <-
+           #create dataframe with channel name and percentage of missing values
+           data.frame(nNA(obj) %>% .$nNAcols %>% .$name,
+                      nNA(obj) %>% .$nNAcols %>% .$pNA) %>%
+           setNames(c("channel", "pNA")) %>%
+           
+           #plot
+           ggplot(aes(x = factor(channel,
+                                 levels = channel),
+                      y = pNA * 100)) +
+           geom_col() +
+           geom_text(aes(label = paste0(round(pNA * 100, digits = 1), "%")), 
+                     vjust = -0.2) +
+           ggtitle("% of missing PSMs per channel", i) +
+           xlab("TMT channel") +
+           ylab("% missing") +
+           theme_bw()
+         
+         #How many PSMs have how many missing TMT channels 
+         B <- 
+           nNA(obj) %>% .$nNArows %>% .$nNA %>% table() %>% as.data.frame() %>%
+           mutate(share = round(Freq/nrow(obj) *100, digits = 1)) %>%
+           setNames(c("No.of.missing.channels", "Count", "Freq")) %>%
+           
+           #plot
+           ggplot(aes(x = No.of.missing.channels,
+                      y = Count)) +
+           geom_col() +
+           geom_text(aes(label = paste0(Freq, "%")),
+                     vjust = -0.2) +
+           ggtitle("PSMs with missing channels [%]", paste(i, "total:", obj %>% nrow(), sep = " ")) +
+           xlab("total number of missing channels") +
+           ylab("N") +
+           ylim(0, nrow(obj)) +
+           theme_bw()
+         
+         Z <- 
+           plot_grid(A, B,
+                     nrow = 1,
+                     ncol = 2,
+                     labels = "AUTO")
+         return(Z)
+       })
+dev.off()
+
+#Reduction of PSM dataset to consider only PSMs with a maximum of 25% MV
+ls_QFeat_filt <- 
+  lapply(X = names(ls_QFeat_filt),
+         FUN = function(i) {
+           
+           #get object  
+           obj <- ls_QFeat_filt[[i]]
+           
+           #adding another assay for 0.25 filtering
+           obj1 <- 
+             addAssay(x = obj,
+                      y = obj[["psms_SPS.MM_filtered"]],
+                      name = "psms_SPS.MM_filtered_0.25") %>% 
+             addAssayLink(object = .,
+                          from = "psms_SPS.MM_filtered",
+                          to = "psms_SPS.MM_filtered_0.25",
+                          varFrom = "PSM.ID",
+                          varTo = "PSM.ID")    
+           
+           #remove PSMs that have more than 25% of channels with NAs
+           obj2 <- filterNA(obj1,
+                            pNA = 0.25,
+                            i = "psms_SPS.MM_filtered_0.25")
+           
+           return(obj2)
+         }) %>%
+  set_names(nm_iter)
+
+```
+
+
+```{r Missing value pattern 3 - 0.25% dataset}
+#overview of missing value pattern for all PSMs with 25% MVs or less
+pdf(file = "graphs/MV_0.25_pattern.pdf", width = 11, height = 8)
+lapply(X = names(ls_QFeat_filt),
+       function(i){
+         #get object
+         obj <- ls_QFeat_filt[[i]][["psms_SPS.MM_filtered_0.25"]]
+         
+         #keep only rows with missing data
+         Z <- 
+           obj %>%
+           assay %>% as.data.frame() %>% 
+           filter(rowSums(is.na(.)) != 0)
+         
+         #aggregation plot for missing values
+         Y <- 
+           aggr(Z,
+                plot = TRUE,
+                numbers = TRUE,
+                prop = FALSE,
+                combined = TRUE,
+                cex.numbers = 0.3,
+                varheight = TRUE)
+         title(main = i,
+               outer = FALSE)
+         
+         #plot of missing value combinations across channels
+         X <- print(gg_miss_upset(Z,
+                                  nsets = ncol(Z),
+                                  nintersects = 20))
+         
+         #combine both plots in a list
+         W <- list(Y, X)
+         
+         return(W)
+       })
+dev.off()
+```
+
+
+```{r Protein PSM support in 0.25 dataset}
+#Protein PSM support pattern of 0.25 datasets
+pdf(file = "graphs/PSM_support_per_protein_0.25.pdf", width = 11, height = 5)
+lapply(X = names(ls_QFeat_filt),
+       FUN = function(i) {
+         
+         #get object  
+         obj <- ls_QFeat_filt[[i]][["psms_SPS.MM_filtered_0.25"]]
+         
+         #PSM count table - PSM per master protein accession
+         Z <-
+           rowData(obj)$Master.Protein.Accessions %>%
+           table() %>%
+           as.data.frame %>% 
+           group_by(Freq) %>%
+           tally() %>% 
+           setNames(c("PSM.per.Accession", "Freq"))
+         
+         #adding grouping for +6 PSMs per protein and summarising counts
+         Y <- 
+           Z %>% 
+           mutate(PSM.per.Accession = ifelse(test = PSM.per.Accession <= 5,
+                                  yes = PSM.per.Accession,
+                                  no = "6+")) %>%
+           group_by(PSM.per.Accession) %>% 
+           summarise(N = sum(Freq)) %>% 
+           mutate(percent = round(N/sum(N) *100, digits = 1))
+         
+         #plot PSM support per protein
+         W <- 
+           Y %>% 
+           ggplot(aes(x = PSM.per.Accession,
+                      y = N,
+                      fill = PSM.per.Accession)) +
+           geom_col() +
+           scale_fill_brewer(palette = "RdBu",
+                             direction = 1) +
+           geom_text(aes(label = N),
+                     vjust = -0.5) +
+           theme_bw() +
+           theme(legend.position = "none") +
+           ggtitle(paste("Protein PSM support:",
+                         i,
+                         "N =",
+                         rowData(obj)$Master.Protein.Accessions %>% unique() %>% length(),
+                         sep = " ")) +
+           xlab("number of PSMs per protein") +
+           ylab("N")
+         
+         #plot relative proportion of PSM support categories
+         U <- 
+           Y %>% 
+           ggplot(aes(x = "",
+                      y = percent,
+                      fill = PSM.per.Accession)) +
+           geom_col() +
+           scale_fill_brewer(palette = "RdBu",
+                             direction = 1) +
+           guides(fill = guide_legend(title = "#PSMs per protein")) +
+           theme_void() +
+           geom_text(aes(label = paste0(percent, "%")),
+                     position = position_stack((vjust = 0.5))) +
+           coord_polar(theta = "y",
+                       start = 0,
+                       direction = -1)
+         
+         S <- plot_grid(W, U,
+                        nrow = 1,
+                        ncol = 2,
+                        labels = "AUTO")
+         return(S)
+       })
+dev.off()
+```
+
+
+```{r single PSM proteins and their missing data structure}
+#list of dataframes containing only single PSM proteins; visualization of their MV pattern
+pdf(file = "graphs/MV_single_PSM_protein_0.25.pdf", width = 11, height = 8)
+single_PSMprot_MV <-
+  lapply(X = names(ls_QFeat_filt),
+         FUN = function(i) {
+           
+           #get object  
+           obj <- ls_QFeat_filt[[i]][["psms_SPS.MM_filtered_0.25"]]
+           
+           #create custom dataframe by adding nNA and "complete case" column
+           Z <-
+             cbind(obj %>% rowData(),
+                   obj %>% assay(),
+                   obj %>% nNA() %>% .$nNArows %>% .$nNA,
+                   obj %>% assay() %>% complete.cases()) %>%
+             as.data.frame() %>% 
+             setNames(c(obj %>% rowData() %>% colnames(),
+                        obj %>% assay %>% colnames(),
+                        "nNa",
+                        "complete.TMT.data"))
+           
+           #dataframe of single PSM support protein accession numbers
+           Y <- 
+             obj %>% rowData() %>% .$Master.Protein.Accessions %>%
+             table() %>%
+             as.data.frame.table %>% 
+             filter(Freq == 1) %>% 
+             setNames(c("Master.Protein.Accessions", "Freq"))
+           
+           #adding custom dataframe Z information to dataframe Y of single PSM support proteins
+           X <- left_join(Y,
+                          Z,
+                          by = "Master.Protein.Accessions")
+           
+           #filter single PSM support proteins that contain missing TMT channels
+           W <- X %>% filter(complete.TMT.data == FALSE)
+           
+           #MV pattern for single PSM proteins
+           V <- aggr(W %>% select(any_of(TMT_order)),
+                     plot = TRUE,
+                     numbers = TRUE,
+                     prop = FALSE,
+                     combined = TRUE,
+                     varheight = FALSE,
+                     cex.numbers = 0.3,
+                     only.miss = TRUE)
+           title(main = i,
+                 outer = FALSE)
+           
+           return(W)
+         }) %>%
+  set_names(nm_iter)
+dev.off()
+
+#Function for viewing all TMT profiles of single PSM proteins in given dataset - 48 proteins per page - adjust page number accordingly for dataset of interest
+fn_plot_single_PSM_MV <-
+  function(dataset, page, title){
+    
+    plot <- 
+      dataset %>% 
+      select(c(Master.Protein.Accessions, any_of(TMT_order))) %>% 
+      pivot_longer(cols = any_of(TMT_order),
+                   names_to = "channel",
+                   values_to = "Intensity") %>% 
+      ggplot(aes(x = factor(channel,
+                            levels = dataset %>% select(any_of(TMT_order)) %>%
+                              colnames() %>% as.character()),
+                 y = log10(Intensity),
+                 group = 1)) +
+      geom_point() +
+      geom_line() +
+      facet_wrap_paginate(~ Master.Protein.Accessions,
+                          ncol = 8,
+                          nrow = 6,
+                          page = page) +
+      ggtitle(label = title,
+              subtitle = paste("page ", page, sep = "")) +
+      xlab("TMT channel") +
+      theme_bw() +
+      theme(axis.text.x = element_text(size = 6, angle = 90, vjust = 0.5),
+            strip.text = element_text(size = 6))
+    #theme(axis.title.x = element_text(size = rel(0.2), angle = 90))
+    
+    return(plot)
+  }
+
+
+#Number of single PSM proteins in each dataset
+for (i in 1:(length(single_PSMprot_MV))) {
+  single_PSMprot_MV[[i]] %>% nrow() %>% print()
+}
+
+#save all single PSM protein profiles with MV - 48 proteins per page -
+pdf(file = "graphs/single PSM protein profiles.pdf", width = 11, height = 8)
+
+#Expal4 dataset
+for (i in 1:1){
+  fn_plot_single_PSM_MV(dataset = single_PSMprot_MV[["Expal4"]],
+                        page = i,
+                        title = paste("single PSM proteins in Expal4, N =",
+                                      nrow(single_PSMprot_MV[["Expal4"]]),
+                                      sep = " ")) %>% 
+    print()
+}
+
+#Expal5 dataset
+for (i in 1:1){
+  fn_plot_single_PSM_MV(dataset = single_PSMprot_MV[["Expal5"]],
+                        page = i,
+                        title = paste("single PSM proteins in Expal5, N =",
+                                      nrow(single_PSMprot_MV[["Expal5"]]),
+                                      sep = " ")) %>% 
+    print()
+}
+
+dev.off()
+
+rm(i)
+
+#create list of accession numbers of single PSM proteins with MV - note that some of these proteins might have more than one PSM in some of the experimental iterations
+single_PSM_MV_accessions <- 
+  lapply(X = names(single_PSMprot_MV),
+         FUN = function(i) {
+           
+           #get object  
+           obj <- single_PSMprot_MV[[i]]
+           
+           #pull accession numbers
+           Z <- obj %>% select(Master.Protein.Accessions,
+                               Iteration,
+                               Quality.Tier,
+                               nNa) %>% as.data.frame()
+           
+           return(Z)
+         }) %>% 
+  set_names(nm_iter)
+
+##Euler diagram of accession numbers between datasets
+ls_Euler <-
+  list(Expal4 = single_PSM_MV_accessions[["Expal4"]] %>% pull(Master.Protein.Accessions),
+       Expal5 = single_PSM_MV_accessions[["Expal5"]] %>% pull(Master.Protein.Accessions)
+       )
+
+pdf(file = "graphs/Euler_single_PSM_MV_proteins.pdf")
+plot(euler(ls_Euler),
+     quantities = TRUE,
+     fills = c("#E69F00", "#009E73", "#CC79A7"),
+     alpha = 1)
+dev.off()
+
+rm(ls_Euler)
+
+single_PSM_MV_accessions <-
+  rbind(single_PSM_MV_accessions[["Expal4"]],
+        single_PSM_MV_accessions[["Expal5"]]) %>% 
+  as.data.frame() %>%
+  arrange(Master.Protein.Accessions)
+
+#save as csv file
+write_excel_csv(single_PSM_MV_accessions, "files/single_PSM_MV_accessions.csv")
+
+rm(single_PSMprot_MV, fn_plot_single_PSM_MV)
+```
+
+
+```{r missing value imputation via knn}
+
+#knn imputation of missing values using log2-scaled TMT abundance values
+ls_QFeat_filt <- 
+  lapply(X = names(ls_QFeat_filt),
+         FUN = function(i) {
+           
+           #get object
+           obj <- ls_QFeat_filt[[i]]
+           
+           #log transform peptide data to reduce total scale
+           obj <- logTransform(object = obj,
+                               base = 2,
+                               i = "psms_SPS.MM_filtered_0.25",
+                               name = "log2_psms")
+           
+           #knn imputation of missing values at psm level (feature imputation: margin is row)
+           obj <- impute(object = obj,
+                         method = "knn",
+                         MARGIN = 1,
+                         i = "log2_psms",
+                         name = "log2_psms_imp")
+           
+           #add extra assay to fill with back-transformed data
+           obj <-
+             addAssay(obj,
+                      obj[["log2_psms_imp"]],
+                      name = "psms_imp") %>%
+             addAssayLink(object = .,
+                          from = "log2_psms_imp",
+                          to = "psms_imp",
+                          varFrom = "PSM.ID",
+                          varTo = "PSM.ID")
+           
+           #replace assay data with antilog values
+           assay(obj[["psms_imp"]]) <- 2^(assay(obj[["log2_psms_imp"]]))
+           
+           
+           #rescale (sum-normalise) psm to a row-sum of 100%
+           obj <- normalize(object = obj,
+                            method = "sum",
+                            i = "psms_imp",
+                            name = "psms_norm")
+           
+           return(obj)
+           
+         }) %>%
+  set_names(nm_iter)
+
+#check that there are no missing channels left
+for(i in 1:(length(ls_QFeat_filt))) {
+  
+  obj <- ls_QFeat_filt[[i]] 
+  
+  nNA(obj, i = "psms_norm")$nNArows$nNA %>% table() %>% print()
+}
+
+#save final PSM file for later aggregation and mapping
+saveRDS(ls_QFeat_filt, file = "files/Expal_ls_QFeat_filt_norm_imp.RDS")
+```
+
+
+```{r Euler post filter}
+##Euler diagram of accession numbers between datasets
+ls_Euler <- list(Expal4 = ls_QFeat_filt[["Expal4"]][["psms_norm"]] %>%
+                   rowData() %>% .$Master.Protein.Accessions %>% unique(),
+                 Expal5 = ls_QFeat_filt[["Expal5"]][["psms_norm"]] %>%
+                   rowData() %>% .$Master.Protein.Accessions %>% unique())
+                 
+
+pdf(file = "graphs/Euler_proteins_0.25_imputed.pdf")
+plot(euler(ls_Euler),
+     quantities = TRUE,
+     fills = c("#E69F00", "#009E73", "#CC79A7"),
+     alpha = 1)
+dev.off()
+
+rm(ls_Euler)
+```
+
+
+```{r session info}
+utils::sessionInfo()
+```
+
