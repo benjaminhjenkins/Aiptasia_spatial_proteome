@@ -1,0 +1,351 @@
+---
+title: "machine_learning_271125"
+output: html_document
+date: "2025-11-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(conflicted)
+library(tidyverse)
+library(pRoloc)
+#library(pRolocdata)
+library(MSnbase)
+library(tictoc)
+
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(tictoc::tic)
+conflicts_prefer(dplyr::mutate)
+conflicts_prefer(magrittr::set_names)
+```
+
+```{r loading data and creating MSnSet}
+
+#master file
+df_Expal_LOPIT <-
+  read.csv(file = "Master_File_complex_09072025_annotated_pred_v7.csv",
+           header = TRUE,
+           na.strings = c("", "NA"))
+
+#label of marker column
+marker_col <- "ML_curated_marker_v7"
+
+group_marker <-
+  df_Expal_LOPIT %>%
+  select(Master.Protein.Accessions, ML_curated_marker_v7) %>% 
+  mutate(ML_curated_marker_v7 = replace(ML_curated_marker_v7,
+                                                  is.na(ML_curated_marker_v7), "unknown"))
+
+
+#list of two- and three-way LOPIT sets
+ls_df_TMT_data <- 
+  list(Expal_4.5 = df_Expal_LOPIT %>% select(2, 82:105) %>% drop_na())
+
+nm_all <- names(ls_df_TMT_data)
+
+#list of MSn_Sets for all LOPIT sets
+ls_MSn_Sets <-
+  lapply(X = names(ls_df_TMT_data),
+         FUN = function(i) {
+
+           obj <- ls_df_TMT_data[[i]]
+
+           obj_annot <-
+             left_join(x = obj,
+                       y = group_marker,
+                       by = "Master.Protein.Accessions")
+           Set <-
+             readMSnSet2(file = obj_annot,
+                         ecol = obj_annot %>% select(-Master.Protein.Accessions, -ML_curated_marker_v7) %>% colnames(),
+                         fnames = "Master.Protein.Accessions")
+
+           return(Set)
+
+         }) %>%
+  set_names(nm_all)
+```
+
+
+```{r QSep resolution}
+
+ls_QSep <- 
+  lapply(X = names(ls_MSn_Sets),
+         FUN = function(i) {
+           
+           obj <- ls_MSn_Sets[[i]]
+           
+           qsep_object <- QSep(obj, fcol = marker_col)
+           
+           return(qsep_object)
+           
+         }) %>% 
+  set_names(nm_all)
+
+lapply(X = names(ls_QSep),
+       FUN = function(i) {
+         
+         obj <- ls_QSep[[i]]
+         
+         #QSep distance and matrix visualised
+         pdf(file = paste0("predictions/Qsep_distances_", i, ".pdf"), width = 11, height = 11)
+         plot(levelPlot(obj))
+         plot(obj)
+         dev.off()
+         
+         #QSep matrix
+         write.csv(obj@xnorm,
+                   file = paste0("predictions/", "Qsep_matrix_", i, ".csv"))
+         
+       })
+
+#Average organelle class profile plot
+lapply(X = names(ls_MSn_Sets),
+       FUN = function(i) {
+         
+         obj <- ls_MSn_Sets[[i]]
+         
+         #histogram
+         hc <- mrkHClust(obj, fcol = marker_col, plot = FALSE)
+         
+         ## order of markers according to histogram
+         mm <- getMarkerClasses(obj, fcol = marker_col)
+         m_order <- levels(factor(mm))[order.dendrogram(hc)]
+         
+         ## average marker profile
+         fmat <- mrkConsProfiles(obj, fcol = marker_col)
+         
+         pdf(file = paste0("predictions/marker_consensus_profiles", i, ".pdf"), width = 11, height = 6)
+         mrkHClust(obj, fcol = marker_col, plot = TRUE)
+         plotConsProfiles(fmat, order=m_order)
+         dev.off()
+       })
+
+
+```
+
+
+```{r tagmap}
+#ls_MSn_Sets_TAGMAP <- readRDS(file = "predictions/ExpalLOPIT_ls_MSnSets_TAGMMAP.rds")
+
+#this run takes ca. 5 minutes
+tic()
+ls_MSnSets_TAGMAP <- 
+  lapply(X = names(ls_MSn_Sets),
+         FUN = function(i) {
+           
+           obj <- ls_MSn_Sets[[i]]
+           
+           params_map <- 
+             tagmMapTrain(object = obj,
+                          fcol = marker_col,
+                          seed = 79)
+           
+           MSn_tagm <-
+             tagmPredict(object = obj, 
+                         params = params_map,
+                         fcol = marker_col)
+           
+           df_output <-
+             fData(MSn_tagm) %>% 
+             mutate(tagm.map.allocation.cutoff_99 =
+                      case_when(.$tagm.map.probability > 0.99 ~ tagm.map.allocation,
+                                TRUE ~ "unknown"))
+           
+           colnames(df_output) <- paste(colnames(df_output), i, sep = ".")
+           
+           write_csv(x = df_output,
+                     file = paste0("predictions/tagm_output_", i, ".csv"))
+           
+           output_list <- 
+             list(tagmMap_params = params_map,
+                  tagmPredicted = MSn_tagm,
+                  dataframe = df_output)
+           
+           return(output_list)
+         }) %>% 
+  set_names(names(ls_MSn_Sets))
+toc()
+
+#plotting and saving the posteriors over cycles
+lapply(X = names(ls_MSnSets_TAGMAP),
+       FUN = function(i) {
+         
+         obj <- ls_MSnSets_TAGMAP[[i]][["tagmMap_params"]]
+         
+         pdf(file = paste0("predictions/tagm_logPosteriors_iterations_", i, ".pdf"))
+         plot(logPosteriors(obj), type = "b", col = "blue", cex = 0.3, ylab = "log-posterior", xlab = "iteration")
+         dev.off()
+         
+       })
+
+saveRDS(object = ls_MSnSets_TAGMAP, file = "predictions/ExpalLOPIT_ls_MSnSets_TAGMMAP.rds")
+```
+
+
+```{r SVM}
+
+#loadRDS
+#ls_params_SVM <- readRDS(file = "predictions/SVM_params_weighted.rds")
+
+#total run time for this dataset is ca 15 minutes
+tic()
+ls_params_SVM <- 
+  lapply(X = names(ls_MSn_Sets),
+         FUN = function(i) {
+           
+           obj <- ls_MSn_Sets[[i]]
+           
+           #class weights
+           class_wghts <- classWeights(obj,
+                                       fcol = "ML_curated_marker_v7")
+           
+           #svm optimisation across multiple sigma and cost values
+           
+           params_SVM <- svmOptimisation(obj,
+                                         fcol = "ML_curated_marker_v7",
+                                         cost = 2^(-4:4),
+                                         sigma = 10^(-3:0),
+                                         times = 100,
+                                         test.size = 0.2,
+                                         xval = 5,
+                                         fun = mean,
+                                         seed = 79,
+                                         class.weights = class_wghts,
+                                         verbose = TRUE)
+           
+           getF1Scores(params_SVM)
+           f1Count(params_SVM)
+           getParams(params_SVM)
+           
+           return(params_SVM)
+           
+         }) %>% 
+  set_names(nm_all)
+toc()           
+
+#save list of parameters
+saveRDS(object = ls_params_SVM, file = "predictions/SVM_params_weighted.rds")
+
+
+#Number of runs with macro F1 scores above 0.9 across different parameter combinations
+sink("predictions/macro_F1_scores_vs_parameters.txt")
+print("Number of runs with macro F1 scores above 0.9 (total =) and chosen parameters for classification")
+
+for (i in names(ls_params_SVM)) {
+  print(i)
+  #getF1Scores(ls_params_SVM[[i]]) %>% print()
+  f1Count(ls_params_SVM[[i]], t = 0.9) %>% print()
+  getParams(ls_params_SVM[[i]]) %>% print()
+  
+}
+sink()
+
+
+#Model parameter and macro F1 score visualisation
+pdf(file = "predictions/SVM_model_optimisation_weighted.pdf", width = 12)
+for (i in names(ls_params_SVM)) {
+  
+  SVM_parameters <- ls_params_SVM[[i]]
+  
+  levelPlot(SVM_parameters) %>% print()
+  plot(SVM_parameters) %>% print()
+  
+}
+dev.off()
+
+
+#parameter overview and classification for each dataset
+ls_MSn_Sets_SVM <- 
+  lapply(X = names(ls_MSn_Sets),
+         FUN = function(i) {
+           
+           #ensuring that correct parameters get fitted for each dataset
+           data <- ls_MSn_Sets[[i]]
+           SVM_parameters <- ls_params_SVM[[i]]
+           
+           #adding classification data to each MSn_Set in LOPIT list using above svm parameters
+           svmres <- svmClassification(data,
+                                       fcol = "ML_curated_marker_v7",
+                                       assessRes = SVM_parameters)
+           
+           #processingData(svmres)
+           
+           #organelle-specific score value given a set quantile threshold (t = 75%)
+           ts <- orgQuants(svmres, fcol = "svm", scol = "svm.scores", mcol = "ML_curated_marker_v7", t = 0.75, verbose = TRUE)
+           
+           #svm prediction considering the above organelle-specific quantile threshold (ts) - positive assignment if score is above 50% quantile threshold
+           svmres <- getPredictions(svmres, fcol = "svm", mcol = "ML_curated_marker_v7", t = ts)
+           
+           #adding dataset prefix to column names
+           df_svmres <- svmres %>% fData()
+           for (col in 2:length(df_svmres)){
+             colnames(df_svmres)[col] <- paste(i, colnames(df_svmres)[col], sep = ".")
+           }
+           
+           #saving prediction in output files
+           write_csv(x = df_svmres,
+                     file = paste0("predictions/svm_data_weighted_", i, ".csv"))
+           
+           list <- list(pred_MSnSet = svmres,
+                        class_thresholds = ts)
+           
+           
+           return(list)
+           
+         }) %>% 
+  set_names(nm_all)
+
+#class-specific score distributions
+pdf(file = "predictions/SVM_score_distribution_weighted.pdf", width = 11, height = 6)
+lapply(X = names(ls_MSn_Sets_SVM),
+       FUN = function(i) {
+         
+         obj <- fData(ls_MSn_Sets_SVM[[i]]$pred_MSnSet)
+         
+         # #colours
+         # marker_class <-
+         #   obj %>% 
+         #   filter(group.marker == "unknown") %>% 
+         #   filter(!is.na(svm.scores)) %>% 
+         #   pull(svm.pred) %>% unique() %>% sort()
+         # #elements to remove
+         # void <- c("unknown")
+         # marker_class <- subset(marker_class, !marker_class %in% void)
+         # cols <- c(getStockcol()[seq_along(marker_class)], setUnknowncol(col = "#E7E7E7"))
+         # marker_class <- c(marker_class, "unknown")
+         
+         svm_items <-
+           obj %>%
+           filter(ML_curated_marker_v7 == "unknown") %>%
+           pull(svm.pred) %>%
+           unique()
+         #colour vector (note that getStockcol() is only 30 colours long)
+         cols <- c(getStockcol()[seq_along(svm_items[1:30])], "#800020")
+         
+         obj %>%
+           filter(ML_curated_marker_v7 == "unknown") %>%
+           ggplot(aes(x = svm,
+                      y = svm.scores,
+                      alpha = 0.6)) +
+           geom_boxplot(outliers = FALSE,
+                        width = 0.5) +
+           geom_jitter(aes(colour = factor(svm.pred, exclude = "unknown")), width = 0.2) +
+           scale_color_manual(values = cols) +
+           theme_bw() +
+           theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+           guides(colour = "none", alpha = "none") +
+           xlab(label = paste0("class [N = ", length(svm_items), "]")) +        
+           ylab(label = "svm score") +
+           labs(title = paste0("SVM classification for unknown proteins: ", i),
+                colour = "prediction above 0.5 class quantile")
+         
+       })
+dev.off()
+
+
+
+```
